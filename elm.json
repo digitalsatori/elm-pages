@@ -3,7 +3,7 @@
     "name": "dillonkearns/elm-pages",
     "summary": "A statically typed site generator.",
     "license": "BSD-3-Clause",
-    "version": "6.0.0",
+    "version": "7.0.0",
     "exposed-modules": [
         "Head",
         "Head.Seo",
@@ -21,7 +21,9 @@
     ],
     "elm-version": "0.19.0 <= v < 0.20.0",
     "dependencies": {
+        "ThinkAlexandria/elm-html-in-elm": "1.0.1 <= v < 2.0.0",
         "avh4/elm-color": "1.0.0 <= v < 2.0.0",
+        "danyx23/elm-mimetype": "4.0.1 <= v < 5.0.0",
         "elm/browser": "1.0.1 <= v < 2.0.0",
         "elm/core": "1.0.2 <= v < 2.0.0",
         "elm/html": "1.0.0 <= v < 2.0.0",
@@ -31,9 +33,6 @@
         "elm/url": "1.0.0 <= v < 2.0.0",
         "elm-community/dict-extra": "2.4.0 <= v < 3.0.0",
         "elm-community/list-extra": "8.2.2 <= v < 9.0.0",
-        "elm-community/result-extra": "2.2.1 <= v < 3.0.0",
-        "lukewestby/elm-string-interpolate": "1.0.4 <= v < 2.0.0",
-        "mgold/elm-nonempty-list": "4.0.2 <= v < 5.0.0",
         "miniBill/elm-codec": "1.2.0 <= v < 2.0.0",
         "noahzgordon/elm-color-extra": "1.0.2 <= v < 2.0.0",
         "tripokey/elm-fuzzy": "5.2.1 <= v < 6.0.0",

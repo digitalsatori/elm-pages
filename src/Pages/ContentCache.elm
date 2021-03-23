@@ -1,7 +1,6 @@
 module Pages.ContentCache exposing
     ( ContentCache
     , Entry(..)
-    , Page
     , Path
     , errorView
     , extractMetadata
@@ -10,7 +9,7 @@ module Pages.ContentCache exposing
     , lookup
     , lookupMetadata
     , pagesWithErrors
-    , pathForUrl
+    , parseContent
     , routesForCache
     , update
     )
@@ -24,6 +23,7 @@ import Json.Decode as Decode
 import Pages.Document as Document exposing (Document)
 import Pages.Internal.String as String
 import Pages.PagePath as PagePath exposing (PagePath)
+import RequestsAndPending exposing (RequestsAndPending)
 import Task exposing (Task)
 import TerminalText as Terminal
 import Url exposing (Url)
@@ -49,7 +49,7 @@ type Entry metadata view
     = NeedContent String metadata
     | Unparsed String metadata (ContentJson String)
       -- TODO need to have an UnparsedMarkup entry type so the right parser is applied
-    | Parsed metadata (ContentJson (Result ParseError view))
+    | Parsed metadata String (ContentJson (Result ParseError view))
 
 
 type alias ParseError =
@@ -76,7 +76,7 @@ getMetadata entry =
         Unparsed extension metadata _ ->
             metadata
 
-        Parsed metadata _ ->
+        Parsed metadata body _ ->
             metadata
 
 
@@ -88,7 +88,7 @@ pagesWithErrors cache =
                 List.filterMap
                     (\( path, value ) ->
                         case value of
-                            Parsed metadata { body } ->
+                            Parsed metadata rawBody { body } ->
                                 case body of
                                     Err parseError ->
                                         createBuildError path parseError |> Just
@@ -133,7 +133,7 @@ createBuildError path decodeError =
     { title = "Metadata Decode Error"
     , message =
         [ Terminal.text "I ran into a problem when parsing the metadata for the page with this path: "
-        , Terminal.text (String.join "/" path)
+        , Terminal.text ("/" ++ String.join "/" path)
         , Terminal.text "\n\n"
         , Terminal.text decodeError
         ]
@@ -167,6 +167,7 @@ parseMetadata maybeInitialPageContent document content =
                                     Just { contentJson, initialUrl } ->
                                         if normalizePath initialUrl.path == (String.join "/" path |> normalizePath) then
                                             Parsed metadata
+                                                contentJson.body
                                                 { body = renderer contentJson.body
                                                 , staticData = contentJson.staticData
                                                 }
@@ -182,6 +183,7 @@ parseMetadata maybeInitialPageContent document content =
                                             -- TODO use types to make this more semantic
                                             Just bodyFromCli ->
                                                 Parsed metadata
+                                                    bodyFromCli
                                                     { body = renderer bodyFromCli
                                                     , staticData = Dict.empty
                                                     }
@@ -284,13 +286,6 @@ routesForCache cacheResult =
             []
 
 
-type alias Page metadata view pathKey =
-    { metadata : metadata
-    , path : PagePath pathKey
-    , view : view
-    }
-
-
 combineTupleResults :
     List ( List String, Result error success )
     -> Result (List error) (List ( List String, success ))
@@ -375,7 +370,7 @@ lazyLoad document urls cacheResult =
                                     urls
                                 |> Task.succeed
 
-                        Parsed _ _ ->
+                        Parsed _ _ _ ->
                             Task.succeed cacheResult
 
                 Nothing ->
@@ -423,7 +418,7 @@ httpTask url =
 
 type alias ContentJson body =
     { body : body
-    , staticData : Dict String String
+    , staticData : RequestsAndPending
     }
 
 
@@ -431,7 +426,7 @@ contentJsonDecoder : Decode.Decoder (ContentJson String)
 contentJsonDecoder =
     Decode.map2 ContentJson
         (Decode.field "body" Decode.string)
-        (Decode.field "staticData" (Decode.dict Decode.string))
+        (Decode.field "staticData" RequestsAndPending.decoder)
 
 
 update :
@@ -447,11 +442,12 @@ update cacheResult renderer urls rawContent =
                 (pathForUrl urls)
                 (\entry ->
                     case entry of
-                        Just (Parsed metadata view) ->
+                        Just (Parsed metadata rawBody view) ->
                             entry
 
                         Just (Unparsed extension metadata content) ->
                             Parsed metadata
+                                content.body
                                 { body = renderer content.body
                                 , staticData = content.staticData
                                 }
@@ -459,6 +455,7 @@ update cacheResult renderer urls rawContent =
 
                         Just (NeedContent extension metadata) ->
                             Parsed metadata
+                                rawContent.body
                                 { body = renderer rawContent.body
                                 , staticData = rawContent.staticData
                                 }
@@ -526,6 +523,6 @@ lookupMetadata pathKey content urls =
                     Unparsed _ metadata _ ->
                         ( pagePath, metadata )
 
-                    Parsed metadata _ ->
+                    Parsed metadata body _ ->
                         ( pagePath, metadata )
             )

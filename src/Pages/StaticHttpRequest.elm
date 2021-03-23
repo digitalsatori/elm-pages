@@ -1,47 +1,43 @@
-module Pages.StaticHttpRequest exposing (Error(..), Request(..), permanentError, resolve, resolveUrls, strippedResponses, toBuildError, urls)
+module Pages.StaticHttpRequest exposing (Error(..), Request(..), Status(..), cacheRequestResolution, resolve, resolveUrls, strippedResponses, toBuildError)
 
 import BuildError exposing (BuildError)
 import Dict exposing (Dict)
-import Pages.Internal.ApplicationType as ApplicationType exposing (ApplicationType)
+import Pages.Internal.ApplicationType exposing (ApplicationType)
 import Pages.StaticHttp.Request
+import RequestsAndPending exposing (RequestsAndPending)
 import Secrets
 import TerminalText as Terminal
 
 
 type Request value
-    = Request ( List (Secrets.Value Pages.StaticHttp.Request.Request), ApplicationType -> Dict String String -> Result Error ( Dict String String, Request value ) )
+    = Request ( List (Secrets.Value Pages.StaticHttp.Request.Request), ApplicationType -> RequestsAndPending -> Result Error ( Dict String String, Request value ) )
     | Done value
 
 
-strippedResponses : ApplicationType -> Request value -> Dict String String -> Dict String String
-strippedResponses appType request rawResponses =
+strippedResponses : ApplicationType -> Request value -> RequestsAndPending -> Dict String String
+strippedResponses =
+    strippedResponsesHelp Dict.empty
+
+
+strippedResponsesHelp : Dict String String -> ApplicationType -> Request value -> RequestsAndPending -> Dict String String
+strippedResponsesHelp usedSoFar appType request rawResponses =
     case request of
         Request ( list, lookupFn ) ->
             case lookupFn appType rawResponses of
                 Err error ->
-                    rawResponses
+                    usedSoFar
 
                 Ok ( partiallyStrippedResponses, followupRequest ) ->
-                    strippedResponses appType followupRequest partiallyStrippedResponses
+                    strippedResponsesHelp (Dict.union usedSoFar partiallyStrippedResponses) appType followupRequest rawResponses
 
         Done value ->
-            rawResponses
+            usedSoFar
 
 
 type Error
     = MissingHttpResponse String
     | DecoderError String
     | UserCalledStaticHttpFail String
-
-
-urls : Request value -> List (Secrets.Value Pages.StaticHttp.Request.Request)
-urls request =
-    case request of
-        Request ( urlList, lookupFn ) ->
-            urlList
-
-        Done value ->
-            []
 
 
 toBuildError : String -> Error -> BuildError
@@ -78,30 +74,7 @@ toBuildError path error =
             }
 
 
-permanentError : ApplicationType -> Request value -> Dict String String -> Maybe Error
-permanentError appType request rawResponses =
-    case request of
-        Request ( urlList, lookupFn ) ->
-            case lookupFn appType rawResponses of
-                Ok ( partiallyStrippedResponses, nextRequest ) ->
-                    permanentError appType nextRequest rawResponses
-
-                Err error ->
-                    case error of
-                        MissingHttpResponse _ ->
-                            Nothing
-
-                        DecoderError _ ->
-                            Just error
-
-                        UserCalledStaticHttpFail string ->
-                            Just error
-
-        Done value ->
-            Nothing
-
-
-resolve : ApplicationType -> Request value -> Dict String String -> Result Error value
+resolve : ApplicationType -> Request value -> RequestsAndPending -> Result Error value
 resolve appType request rawResponses =
     case request of
         Request ( urlList, lookupFn ) ->
@@ -116,19 +89,62 @@ resolve appType request rawResponses =
             Ok value
 
 
-resolveUrls : ApplicationType -> Request value -> Dict String String -> ( Bool, List (Secrets.Value Pages.StaticHttp.Request.Request) )
+resolveUrls : ApplicationType -> Request value -> RequestsAndPending -> ( Bool, List (Secrets.Value Pages.StaticHttp.Request.Request) )
 resolveUrls appType request rawResponses =
     case request of
         Request ( urlList, lookupFn ) ->
             case lookupFn appType rawResponses of
-                Ok ( partiallyStrippedResponses, nextRequest ) ->
+                Ok ( _, nextRequest ) ->
                     resolveUrls appType nextRequest rawResponses
                         |> Tuple.mapSecond ((++) urlList)
 
-                Err error ->
+                Err _ ->
                     ( False
                     , urlList
                     )
 
-        Done value ->
+        Done _ ->
             ( True, [] )
+
+
+cacheRequestResolution :
+    ApplicationType
+    -> Request value
+    -> RequestsAndPending
+    -> Status value
+cacheRequestResolution =
+    cacheRequestResolutionHelp []
+
+
+type Status value
+    = Incomplete (List (Secrets.Value Pages.StaticHttp.Request.Request))
+    | HasPermanentError Error
+    | Complete value -- TODO include stripped responses?
+
+
+cacheRequestResolutionHelp :
+    List (Secrets.Value Pages.StaticHttp.Request.Request)
+    -> ApplicationType
+    -> Request value
+    -> RequestsAndPending
+    -> Status value
+cacheRequestResolutionHelp foundUrls appType request rawResponses =
+    case request of
+        Request ( urlList, lookupFn ) ->
+            case lookupFn appType rawResponses of
+                Ok ( partiallyStrippedResponses, nextRequest ) ->
+                    cacheRequestResolutionHelp urlList appType nextRequest rawResponses
+
+                Err error ->
+                    case error of
+                        MissingHttpResponse string ->
+                            Incomplete (urlList ++ foundUrls)
+
+                        DecoderError string ->
+                            HasPermanentError error
+
+                        UserCalledStaticHttpFail string ->
+                            HasPermanentError error
+
+        Done value ->
+            Complete value

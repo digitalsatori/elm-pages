@@ -1,15 +1,14 @@
 module StaticHttpUnitTests exposing (all)
 
-import Dict exposing (Dict)
+import Dict
 import Expect
-import Json.Decode.Exploration
 import OptimizedDecoder as Decode
 import Pages.Internal.ApplicationType as ApplicationType
 import Pages.StaticHttp as StaticHttp
 import Pages.StaticHttp.Request as Request
 import Pages.StaticHttpRequest as StaticHttpRequest
 import Secrets
-import Test exposing (Test, describe, only, test)
+import Test exposing (Test, describe, test)
 
 
 getWithoutSecrets url =
@@ -21,7 +20,7 @@ requestsDict requestMap =
         |> List.map
             (\( request, response ) ->
                 ( request |> Request.hash
-                , response
+                , Just response
                 )
             )
         |> Dict.fromList
