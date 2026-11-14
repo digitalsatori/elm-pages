@@ -1,11 +1,13 @@
-module Pages.Internal.Platform.Effect exposing (..)
+module Pages.Internal.Platform.Effect exposing (Effect(..))
 
-import Pages.Internal.Platform.ToJsPayload exposing (ToJsPayload)
-import Pages.StaticHttp exposing (RequestDetails)
+import Bytes exposing (Bytes)
+import Pages.Internal.Platform.ToJsPayload exposing (ToJsSuccessPayloadNewCombined)
+import Pages.StaticHttp.Request as StaticHttp
 
 
-type Effect pathKey
+type Effect
     = NoEffect
-    | SendJsData (ToJsPayload pathKey)
-    | FetchHttp { masked : RequestDetails, unmasked : RequestDetails }
-    | Batch (List (Effect pathKey))
+    | FetchHttp (List StaticHttp.Request)
+    | Batch (List Effect)
+    | SendSinglePage ToJsSuccessPayloadNewCombined
+    | SendSinglePageNew Bytes ToJsSuccessPayloadNewCombined

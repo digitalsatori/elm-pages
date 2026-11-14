@@ -1,0 +1,18 @@
+[build]
+  functions = "functions/"
+  publish = "dist/"
+  command = "export ELM_HOME=\"$NETLIFY_BUILD_BASE/cache/elm\" && (cd ../../ && npm install && npx --no-install elm-tooling install && npm run build:generator) && npm install && npm run generate:tailwind && npm run build && cp secret-note.txt functions/server-render/"
+  ignore = "/bin/false"
+
+[dev]
+  autoLaunch = true
+  framework = "#static"
+
+[functions]
+  included_files = ["content/**"]
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "*"
+  to = "/.netlify/functions/render/:splat"
+  status = 200

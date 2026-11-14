@@ -1,0 +1,388 @@
+module StreamTests exposing (run)
+
+import BackendTask exposing (BackendTask)
+import BackendTask.Custom
+import BackendTask.Http exposing (Error(..))
+import BackendTask.Stream as Stream exposing (Stream, defaultCommandOptions)
+import BackendTaskTest exposing (testTask, testScript)
+import Dict
+import Expect
+import FatalError exposing (FatalError)
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Pages.Internal.FatalError exposing (FatalError(..))
+import Pages.Script as Script exposing (Script)
+import TerminalText exposing (fromAnsiString)
+import Test
+
+
+run : Script
+run =
+    testScript "Stream"
+        [ Stream.fromString "asdf\nqwer\n"
+            |> Stream.pipe (Stream.command "wc" [ "-l" ])
+            |> Stream.read
+            |> try
+            |> testTask "capture stdin"
+                (\{ body } ->
+                    body
+                        |> String.trim
+                        |> Expect.equal
+                            "2"
+                )
+        , Stream.fromString "asdf\nqwer\n"
+            |> Stream.pipe (Stream.command "wc" [ "-l" ])
+            |> Stream.run
+            |> testTask "run stdin"
+                (\() ->
+                    Expect.pass
+                )
+        , Stream.command "does-not-exist" []
+            |> Stream.run
+            |> expectError "command with error"
+                "Error: spawn does-not-exist ENOENT"
+        , BackendTask.Custom.run "hello"
+            Encode.null
+            Decode.string
+            |> try
+            |> testTask "custom task"
+                (Expect.equal "Hello!")
+        , Stream.fromString "asdf\nqwer\n"
+            |> Stream.pipe (Stream.customDuplex "upperCaseStream" Encode.null)
+            |> Stream.read
+            |> try
+            |> testTask "custom duplex"
+                (.body >> Expect.equal "ASDF\nQWER\n")
+        , Stream.customRead "customReadStream" Encode.null
+            |> Stream.read
+            |> try
+            |> testTask "custom read"
+                (.body >> Expect.equal "Hello from customReadStream!")
+        , Stream.fromString "qwer\n"
+            |> Stream.pipe (Stream.customDuplex "customReadStream" Encode.null)
+            |> Stream.read
+            |> try
+            |> expectError "invalid stream"
+                "Expected 'customReadStream' to be a duplex stream!"
+        , Stream.fileRead "elm.json"
+            |> Stream.pipe Stream.gzip
+            |> Stream.pipe (Stream.fileWrite zipFile)
+            |> Stream.run
+            |> BackendTask.andThen
+                (\() ->
+                    Stream.fileRead zipFile
+                        |> Stream.pipe Stream.unzip
+                        |> Stream.readJson (Decode.field "type" Decode.string)
+                        |> try
+                )
+            |> testTask "zip and unzip" (.body >> Expect.equal "application")
+        , Stream.fromString
+            """module            Foo
+       
+a = 1
+b =            2
+               """
+            |> Stream.pipe (Stream.command "elm-format" [ "--stdin" ])
+            |> Stream.read
+            |> try
+            |> testTask "elm-format --stdin"
+                (\{ metadata, body } ->
+                    body
+                        |> Expect.equal
+                            """module Foo exposing (a, b)
+
+
+a =
+    1
+
+
+b =
+    2
+"""
+                )
+        , Stream.fromString "module A\na=0"
+            |> Stream.pipe (Stream.command "elm-format" [ "--stdin" ])
+            |> Stream.pipe (Stream.fileWrite "formatted-elm.txt")
+            |> Stream.run
+            |> BackendTask.quiet
+            |> BackendTask.andThen
+                (\() ->
+                    Stream.fileRead "formatted-elm.txt"
+                        |> Stream.read
+                        |> try
+                )
+            |> testTask "write to file"
+                (\{ metadata, body } ->
+                    body
+                        |> Expect.equal
+                            "module A exposing (a)\n\n\na =\n    0\n"
+                )
+        , Stream.fileRead "elm.json"
+            |> Stream.pipe
+                (Stream.command "jq"
+                    [ """."source-directories"[0]"""
+                    ]
+                )
+            |> Stream.readJson Decode.string
+            |> try
+            |> testTask "read command output as JSON"
+                (.body >> Expect.equal "src")
+        , Stream.fromString "invalid elm module"
+            |> Stream.pipe
+                (Stream.commandWithOptions
+                    (defaultCommandOptions
+                        |> Stream.allowNon0Status
+                        |> Stream.withOutput Stream.MergeStderrAndStdout
+                    )
+                    "elm-format"
+                    [ "--stdin" ]
+                )
+            |> Stream.read
+            |> try
+            |> testTask "stderr"
+                (.body >> Expect.equal "Unable to parse file <STDIN>:1:13 To see a detailed explanation, run elm make on the file.\n")
+        , Stream.http
+            { url = "https://jsonplaceholder.typicode.com/posts/124"
+            , timeoutInMs = Nothing
+            , body = BackendTask.Http.emptyBody
+            , retries = Nothing
+            , headers = []
+            , method = "GET"
+            }
+            |> Stream.read
+            |> BackendTask.mapError .recoverable
+            |> BackendTask.toResult
+            |> testTask "output from HTTP"
+                (\result ->
+                    case result of
+                        Ok _ ->
+                            Expect.fail ("Expected a failure, but got success!\n\n" ++ Debug.toString result)
+
+                        Err (Stream.CustomError (BadStatus meta _) _) ->
+                            meta.statusCode
+                                |> Expect.equal 404
+
+                        _ ->
+                            Expect.fail ("Unexpected error\n\n" ++ Debug.toString result)
+                )
+        , Stream.fromString "Hello!"
+            |> Stream.pipe
+                (Stream.httpWithInput
+                    { url = "https://jsonplaceholder.typicode.com/posts/124"
+                    , timeoutInMs = Nothing
+                    , retries = Nothing
+                    , headers = []
+                    , method = "POST"
+                    }
+                )
+            |> Stream.pipe Stream.stdout
+            |> Stream.run
+            |> expectError "HTTP error in the middle of a stream"
+                "HTTP request failed: 404 Not Found"
+        , Stream.fromString "This is input..."
+            |> Stream.pipe
+                (Stream.customTransformWithMeta
+                    "upperCaseStream"
+                    Encode.null
+                    (Decode.string |> Decode.map Ok)
+                )
+            |> Stream.read
+            |> try
+            |> testTask "duplex meta"
+                (Expect.equal
+                    { metadata = "Hi! I'm metadata from upperCaseStream!"
+                    , body = "THIS IS INPUT..."
+                    }
+                )
+        , Stream.fromString "This is input to writeStream!\n"
+            |> Stream.pipe
+                (Stream.customWriteWithMeta
+                    "customWrite"
+                    Encode.null
+                    (Decode.string |> Decode.map Ok)
+                )
+            |> Stream.readMetadata
+            |> try
+            |> testTask "writeStream meta"
+                (Expect.equal "Hi! I'm metadata from customWriteStream!")
+        , Stream.fileRead "does-not-exist"
+            |> Stream.run
+            |> expectErrorContains "file not found error"
+                "ENOENT: no such file or directory"
+        , Stream.fromString "This is input..."
+            |> Stream.pipe (Stream.fileWrite "/this/is/invalid.txt")
+            |> Stream.run
+            -- Linux returns EACCES (permission denied), macOS returns ENOENT
+            |> expectErrorContains "invalid file write destination"
+                "mkdir '/this'"
+        , Stream.gzip
+            |> Stream.read
+            |> try
+            |> BackendTask.do
+            |> testTask "gzip alone is no-op"
+                (\() ->
+                    Expect.pass
+                )
+          -- Test that gzip with no input produces valid output that can be unzipped
+        , Stream.gzip
+            |> Stream.pipe Stream.unzip
+            |> Stream.read
+            |> try
+            |> testTask "gzip with no input can be unzipped to empty"
+                (\{ body } ->
+                    body
+                        |> Expect.equal ""
+                )
+          -- Test that a command with no stdin input completes without hanging
+          -- This is the fix for GUI apps like ksdiff/meld that wait for stdin to close
+        , Stream.command "echo" [ "hello from command with no stdin" ]
+            |> Stream.read
+            |> try
+            |> testTask "command with no stdin input"
+                (\{ body } ->
+                    body
+                        |> String.trim
+                        |> Expect.equal "hello from command with no stdin"
+                )
+          -- Test piping gzip output to a file, then reading and unzipping
+        , Stream.gzip
+            |> Stream.pipe (Stream.fileWrite "empty-gzip-test.gz")
+            |> Stream.run
+            |> BackendTask.andThen
+                (\() ->
+                    Stream.fileRead "empty-gzip-test.gz"
+                        |> Stream.pipe Stream.unzip
+                        |> Stream.read
+                        |> try
+                )
+            |> testTask "gzip with no input written to file can be read and unzipped"
+                (\{ body } ->
+                    body
+                        |> Expect.equal ""
+                )
+        , Script.exec "does-not-exist-exec" []
+            |> expectError "exec with non-0 fails"
+                "Error: spawn does-not-exist-exec ENOENT"
+        , Script.command "does-not-exist-command" []
+            |> expectError "command with non-0 fails"
+                "Error: spawn does-not-exist-command ENOENT"
+          -- Test that stream errors are captured properly
+          -- This verifies the try-catch around consumers
+        , Stream.fromString "test data"
+            |> Stream.pipe (Stream.command "cat" [])
+            |> Stream.read
+            |> try
+            |> testTask "piped command captures output correctly"
+                (\{ body } ->
+                    body |> Expect.equal "test data"
+                )
+          -- Test that corrupted gzip data returns proper error
+          -- This verifies the error handler on unzip stream
+        , Stream.fromString "this is not gzipped data"
+            |> Stream.pipe Stream.unzip
+            |> Stream.read
+            |> try
+            |> expectErrorContains "invalid gzip data returns error"
+                "unzip error"
+          -- Test that piping through multiple transforms works
+          -- This exercises the finish/end event handling
+        , Stream.fromString "hello world"
+            |> Stream.pipe Stream.gzip
+            |> Stream.pipe Stream.unzip
+            |> Stream.read
+            |> try
+            |> testTask "gzip then unzip roundtrip"
+                (\{ body } ->
+                    body
+                        |> Expect.equal "hello world"
+                )
+          -- Test command with non-zero exit that we allow
+          -- Verifies metadata resolution and allowNon0Status works correctly
+        , Stream.commandWithOptions
+            (defaultCommandOptions |> Stream.allowNon0Status)
+            "sh"
+            [ "-c", "echo success && exit 42" ]
+            |> Stream.read
+            |> try
+            |> testTask "command with allowNon0Status succeeds on non-zero exit"
+                (\{ body } ->
+                    body
+                        |> String.trim
+                        |> Expect.equal "success"
+                )
+          -- Test that readJson handles stream errors properly (not crash)
+          -- This verifies the Decode.oneOf error handling in readJson
+        , Stream.fromString "not valid json at all"
+            |> Stream.readJson Decode.value
+            |> try
+            |> expectErrorContains "readJson handles parse errors gracefully"
+                "Unexpected token"
+        ]
+
+
+
+expectError : String -> String -> BackendTask FatalError a -> BackendTask FatalError Test.Test
+expectError name message task =
+    task
+        |> BackendTask.toResult
+        |> BackendTask.map
+            (\result ->
+                Test.test name <|
+                    \() ->
+                        case result of
+                            Ok data ->
+                                --Expect.fail "Expected a failure, but got success!"
+                                result
+                                    |> Debug.toString
+                                    |> Expect.equal "Expected a failure, but got success!"
+
+                            Err error ->
+                                let
+                                    (FatalError info) =
+                                        error
+                                in
+                                info.body
+                                    |> TerminalText.fromAnsiString
+                                    |> TerminalText.toPlainString
+                                    |> Expect.equal message
+            )
+
+
+expectErrorContains : String -> String -> BackendTask FatalError a -> BackendTask FatalError Test.Test
+expectErrorContains name substring task =
+    task
+        |> BackendTask.toResult
+        |> BackendTask.map
+            (\result ->
+                Test.test name <|
+                    \() ->
+                        case result of
+                            Ok _ ->
+                                Expect.fail "Expected a failure, but got success!"
+
+                            Err error ->
+                                let
+                                    (FatalError info) =
+                                        error
+
+                                    errorText =
+                                        info.body
+                                            |> TerminalText.fromAnsiString
+                                            |> TerminalText.toPlainString
+                                in
+                                if String.contains substring errorText then
+                                    Expect.pass
+
+                                else
+                                    Expect.fail ("Expected error to contain '" ++ substring ++ "' but got: " ++ errorText)
+            )
+
+
+try : BackendTask { error | fatal : FatalError } data -> BackendTask FatalError data
+try =
+    BackendTask.allowFatal
+
+
+zipFile : String
+zipFile =
+    "elm-review-report.gz.json"

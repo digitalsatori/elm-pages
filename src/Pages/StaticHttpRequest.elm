@@ -1,134 +1,103 @@
-module Pages.StaticHttpRequest exposing (Error(..), Request(..), permanentError, resolve, resolveUrls, strippedResponses, toBuildError, urls)
+module Pages.StaticHttpRequest exposing (Error(..), MockResolver, RawRequest(..), Status(..), cacheRequestResolution, mockResolve, toBuildError)
 
 import BuildError exposing (BuildError)
-import Dict exposing (Dict)
-import Pages.Internal.ApplicationType as ApplicationType exposing (ApplicationType)
+import FatalError exposing (FatalError)
+import Pages.Internal.FatalError
 import Pages.StaticHttp.Request
-import Secrets
+import RequestsAndPending exposing (RequestsAndPending)
 import TerminalText as Terminal
 
 
-type Request value
-    = Request ( List (Secrets.Value Pages.StaticHttp.Request.Request), ApplicationType -> Dict String String -> Result Error ( Dict String String, Request value ) )
-    | Done value
+type alias MockResolver =
+    Pages.StaticHttp.Request.Request
+    -> Maybe RequestsAndPending.Response
 
 
-strippedResponses : ApplicationType -> Request value -> Dict String String -> Dict String String
-strippedResponses appType request rawResponses =
-    case request of
-        Request ( list, lookupFn ) ->
-            case lookupFn appType rawResponses of
-                Err error ->
-                    rawResponses
-
-                Ok ( partiallyStrippedResponses, followupRequest ) ->
-                    strippedResponses appType followupRequest partiallyStrippedResponses
-
-        Done value ->
-            rawResponses
+type RawRequest error value
+    = Request (List Pages.StaticHttp.Request.Request) (Maybe MockResolver -> RequestsAndPending -> RawRequest error value)
+    | ApiRoute (Result error value)
+    | InternalError FatalError
 
 
 type Error
-    = MissingHttpResponse String
-    | DecoderError String
+    = DecoderError String
     | UserCalledStaticHttpFail String
-
-
-urls : Request value -> List (Secrets.Value Pages.StaticHttp.Request.Request)
-urls request =
-    case request of
-        Request ( urlList, lookupFn ) ->
-            urlList
-
-        Done value ->
-            []
+    | InternalFailure FatalError
 
 
 toBuildError : String -> Error -> BuildError
 toBuildError path error =
     case error of
-        MissingHttpResponse missingKey ->
-            { title = "Missing Http Response"
-            , message =
-                [ Terminal.text path
-                , Terminal.text "\n\n"
-                , Terminal.text missingKey
-                ]
-            , fatal = True
-            }
-
         DecoderError decodeErrorMessage ->
             { title = "Static Http Decoding Error"
             , message =
-                [ Terminal.text path
-                , Terminal.text "\n\n"
-                , Terminal.text decodeErrorMessage
+                [ Terminal.text decodeErrorMessage
                 ]
+            , path = path
             , fatal = True
             }
 
         UserCalledStaticHttpFail decodeErrorMessage ->
             { title = "Called Static Http Fail"
             , message =
-                [ Terminal.text path
-                , Terminal.text "\n\n"
-                , Terminal.text <| "I ran into a call to `Pages.StaticHttp.fail` with message: " ++ decodeErrorMessage
+                [ Terminal.text <| "I ran into a call to `BackendTask.fail` with message: " ++ decodeErrorMessage
                 ]
+            , path = path
+            , fatal = True
+            }
+
+        InternalFailure (Pages.Internal.FatalError.FatalError buildError) ->
+            { title = "Internal error"
+            , message =
+                [ Terminal.text <| "Please report this error!"
+                , Terminal.text ""
+                , Terminal.text ""
+                , Terminal.text buildError.body
+                ]
+            , path = path
             , fatal = True
             }
 
 
-permanentError : ApplicationType -> Request value -> Dict String String -> Maybe Error
-permanentError appType request rawResponses =
+mockResolve : (FatalError -> error) -> RawRequest error value -> MockResolver -> Result error value
+mockResolve onInternalError request mockResolver =
     case request of
-        Request ( urlList, lookupFn ) ->
-            case lookupFn appType rawResponses of
-                Ok ( partiallyStrippedResponses, nextRequest ) ->
-                    permanentError appType nextRequest rawResponses
+        Request _ lookupFn ->
+            let
+                nextRequest : RawRequest error value
+                nextRequest =
+                    lookupFn (Just mockResolver) RequestsAndPending.empty
+            in
+            mockResolve onInternalError nextRequest mockResolver
 
-                Err error ->
-                    case error of
-                        MissingHttpResponse _ ->
-                            Nothing
+        ApiRoute value ->
+            value
 
-                        DecoderError _ ->
-                            Just error
-
-                        UserCalledStaticHttpFail string ->
-                            Just error
-
-        Done value ->
-            Nothing
+        InternalError err ->
+            Err (onInternalError err)
 
 
-resolve : ApplicationType -> Request value -> Dict String String -> Result Error value
-resolve appType request rawResponses =
+cacheRequestResolution :
+    RawRequest error value
+    -> RequestsAndPending
+    -> Status error value
+cacheRequestResolution request rawResponses =
     case request of
-        Request ( urlList, lookupFn ) ->
-            case lookupFn appType rawResponses of
-                Ok ( partiallyStrippedResponses, nextRequest ) ->
-                    resolve appType nextRequest rawResponses
+        Request urlList lookupFn ->
+            if List.isEmpty urlList then
+                cacheRequestResolution (lookupFn Nothing rawResponses) rawResponses
 
-                Err error ->
-                    Err error
+            else
+                Incomplete urlList (Request [] lookupFn)
 
-        Done value ->
-            Ok value
+        ApiRoute value ->
+            Complete value
+
+        InternalError err ->
+            HasPermanentError (InternalFailure err)
 
 
-resolveUrls : ApplicationType -> Request value -> Dict String String -> ( Bool, List (Secrets.Value Pages.StaticHttp.Request.Request) )
-resolveUrls appType request rawResponses =
-    case request of
-        Request ( urlList, lookupFn ) ->
-            case lookupFn appType rawResponses of
-                Ok ( partiallyStrippedResponses, nextRequest ) ->
-                    resolveUrls appType nextRequest rawResponses
-                        |> Tuple.mapSecond ((++) urlList)
-
-                Err error ->
-                    ( False
-                    , urlList
-                    )
-
-        Done value ->
-            ( True, [] )
+type Status error value
+    = Incomplete (List Pages.StaticHttp.Request.Request) (RawRequest error value)
+    | HasPermanentError Error
+    | Complete (Result error value)

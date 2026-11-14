@@ -1,12 +1,13 @@
 {
   "compilerOptions": {
     "types": ["node"],
-    "module": "commonjs",
-    "target": "es5",
+    "moduleResolution": "node",
+    "checkJs": true,
+    "allowJs": true,
     "strict": true,
-    "sourceMap": false,
     "resolveJsonModule": true,
-    "lib": ["es2015", "es2017.object"]
+    "lib": ["es2015", "es2017.object", "esnext", "dom"],
+    "esModuleInterop": true
   },
   "exclude": ["node_modules", "generated"]
 }

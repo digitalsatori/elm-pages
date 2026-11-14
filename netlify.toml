@@ -1,5 +1,16 @@
 [build]
   base = "examples/docs/"
+  functions = "functions/"
   publish = "dist/"
-  command = "export ELM_HOME=\"$NETLIFY_BUILD_BASE/cache/elm\" && cd ../../ && npm run build && cd examples/docs && npm install && npm run build"
-  ignore = "git diff --quiet HEAD^ HEAD `git rev-parse --show-toplevel`"
+  command = "export ELM_HOME=\"$NETLIFY_BUILD_BASE/cache/elm\" && (cd ../../ && npm install && npm run build:generator) && npm install && npx --no-install elm-tooling install && npx elm-pages build && (cd functions/process-url && npm i)"
+
+[[redirects]]
+  from = "/screenshot/*"
+  to = "/.netlify/functions/screenshot"
+  status = 200
+
+[dev]
+  command = "npm start"
+  targetPort = 1234
+  autoLaunch = true
+  framework = "#custom"

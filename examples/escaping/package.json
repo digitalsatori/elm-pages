@@ -1,0 +1,21 @@
+{
+  "name": "elm-pages-escaping-example",
+  "type": "module",
+  "version": "3.0.0-beta.3",
+  "description": "Example site built with elm-pages.",
+  "scripts": {
+    "start": "elm-pages dev",
+    "test": "elm-pages build --debug && npm run clean-diff && elm-pages build && npm run clean-diff",
+    "clean-diff": "sed -E -i.bak 's/[.-][a-zA-Z0-9_-]{8}([.-][a-z]{2,4})/.HASH\\1/gi' ./dist/escaping/index.html && sed -i.bak 's/<meta name=\"generator\".*$//gi' ./dist/escaping/index.html  && git diff --exit-code ./dist",
+    "build": "elm-pages build"
+  },
+  "author": "Dillon Kearns",
+  "license": "BSD-3",
+  "devDependencies": {
+    "elm-pages": "file:../..",
+    "elm-review": "^2.13.5",
+    "elm-tooling": "^1.15.1",
+    "esbuild": "^0.27.2",
+    "vite": "^6.0.0"
+  }
+}

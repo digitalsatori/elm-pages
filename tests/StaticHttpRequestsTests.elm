@@ -1,32 +1,32 @@
 module StaticHttpRequestsTests exposing (all)
 
+import ApiRoute
+import BackendTask exposing (BackendTask)
+import BackendTask.Http
+import Bytes.Decode
+import Bytes.Encode
 import Codec
-import Dict exposing (Dict)
+import Dict
 import Expect
+import FatalError exposing (FatalError)
 import Html
-import Json.Decode as JD
+import Json.Decode as JD exposing (Decoder)
 import Json.Encode as Encode
-import OptimizedDecoder as Decode exposing (Decoder)
-import Pages.ContentCache as ContentCache
-import Pages.Document as Document
-import Pages.ImagePath as ImagePath
-import Pages.Internal.Platform.Cli as Main exposing (..)
+import Pages.Internal.Platform.Cli exposing (..)
 import Pages.Internal.Platform.Effect as Effect exposing (Effect)
-import Pages.Internal.Platform.ToJsPayload as ToJsPayload exposing (ToJsPayload)
-import Pages.Internal.StaticHttpBody as StaticHttpBody
-import Pages.Manifest as Manifest
-import Pages.PagePath as PagePath
-import Pages.StaticHttp as StaticHttp
+import Pages.Internal.Platform.ToJsPayload as ToJsPayload
+import Pages.ProgramConfig exposing (ProgramConfig)
+import Pages.SiteConfig exposing (SiteConfig)
 import Pages.StaticHttp.Request as Request
-import PagesHttp
 import ProgramTest exposing (ProgramTest)
 import Regex
-import Secrets
+import RenderRequest
+import RequestsAndPending exposing (ResponseBody(..))
+import Server.Response as Response
 import SimulatedEffect.Cmd
-import SimulatedEffect.Http as Http
 import SimulatedEffect.Ports
-import Test exposing (Test, describe, only, skip, test)
-import Test.Http
+import Test exposing (Test, describe, test)
+import UrlPath
 
 
 all : Test
@@ -34,312 +34,287 @@ all =
     describe "Static Http Requests"
         [ test "initial requests are sent out" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") starDecoder
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 86 }"""
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                              , """{"stargazer_count":86}"""
-                              )
-                            ]
-                          )
-                        ]
+                startSimple []
+                    (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" starDecoder |> BackendTask.allowFatal)
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (JsonBody
+                            (Encode.object [ ( "stargazer_count", Encode.int 86 ) ])
+                        )
+                    |> expectSuccess []
+        , test "StaticHttp request for initial are resolved" <|
+            \() ->
+                startSimple
+                    [ "post-1" ]
+                    (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" starDecoder |> BackendTask.allowFatal)
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (JsonBody
+                            (Encode.object [ ( "stargazer_count", Encode.int 86 ) ])
+                        )
+                    |> expectSuccess []
+        , describe "single page renders"
+            [ test "single pages that are pre-rendered" <|
+                \() ->
+                    startSimple [ "post-1" ]
+                        (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" starDecoder |> BackendTask.allowFatal)
+                        |> simulateHttp
+                            (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                            (JsonBody
+                                (Encode.object [ ( "stargazer_count", Encode.int 86 ) ])
+                            )
+                        |> ProgramTest.expectOutgoingPortValues
+                            "toJsPort"
+                            (Codec.decoder (ToJsPayload.successCodecNew2 "" ""))
+                            (\actualPorts ->
+                                case actualPorts of
+                                    [ ToJsPayload.PageProgress portData ] ->
+                                        if portData.is404 then
+                                            Expect.fail "Expected page to be found and rendered"
+
+                                        else
+                                            Expect.pass
+
+                                    _ ->
+                                        Expect.fail <| "Expected exactly 1 port of type PageProgress. Instead, got \n" ++ Debug.toString actualPorts
+                            )
+            ]
+        , test "the stripped JSON from the same request with different decoders is merged so the decoders succeed" <|
+            \() ->
+                startSimple
+                    [ "post-1" ]
+                    (BackendTask.map2 Tuple.pair
+                        (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages"
+                            (JD.field "stargazer_count" JD.int)
+                            |> BackendTask.allowFatal
+                        )
+                        (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages"
+                            (JD.field "language" JD.string)
+                            |> BackendTask.allowFatal
+                        )
+                    )
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (JsonBody
+                            (Encode.object
+                                [ ( "stargazer_count", Encode.int 86 )
+                                , ( "language", Encode.string "Elm" )
+                                ]
+                            )
+                        )
+                    |> expectSuccess []
         , test "andThen" <|
             \() ->
-                start
-                    [ ( [ "elm-pages" ]
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") (Decode.succeed ())
-                            |> StaticHttp.andThen
-                                (\continueUrl ->
-                                    StaticHttp.get (Secrets.succeed "NEXT-REQUEST") (Decode.succeed ())
-                                )
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """null"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "NEXT-REQUEST"
-                        """null"""
-                    |> expectSuccess
-                        [ ( "elm-pages"
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                              , """null"""
-                              )
-                            , ( get "NEXT-REQUEST"
-                              , """null"""
-                              )
-                            ]
-                          )
-                        ]
-        , test "andThen chain avoids repeat requests" <|
-            \() ->
-                let
-                    getReq url decoder =
-                        StaticHttp.request
-                            (Secrets.succeed (get url))
-                            decoder
-
-                    pokemonDetailRequest : StaticHttp.Request ()
-                    pokemonDetailRequest =
-                        getReq
-                            "https://pokeapi.co/api/v2/pokemon/"
-                            (Decode.list
-                                (Decode.field "url" Decode.string
-                                    |> Decode.map
-                                        (\url ->
-                                            getReq url
-                                                (Decode.field "image" Decode.string)
-                                        )
-                                )
+                startSimple
+                    [ "elm-pages" ]
+                    (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" (JD.succeed ())
+                        |> BackendTask.allowFatal
+                        |> BackendTask.andThen
+                            (\_ ->
+                                BackendTask.Http.getJson "NEXT-REQUEST" (JD.succeed ())
+                                    |> BackendTask.allowFatal
                             )
-                            |> StaticHttp.resolve
-                            |> StaticHttp.map (\_ -> ())
-                in
-                start
-                    [ ( [ "elm-pages" ], pokemonDetailRequest )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://pokeapi.co/api/v2/pokemon/"
-                        """[
-                            {"url": "url1"},
-                            {"url": "url2"},
-                            {"url": "url3"},
-                            {"url": "url4"},
-                            {"url": "url5"},
-                            {"url": "url6"},
-                            {"url": "url7"},
-                            {"url": "url8"},
-                            {"url": "url9"},
-                            {"url": "url10"}
-                            ]"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url1"
-                        """{"image": "image1.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url2"
-                        """{"image": "image2.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url3"
-                        """{"image": "image3.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url4"
-                        """{"image": "image4.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url5"
-                        """{"image": "image5.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url6"
-                        """{"image": "image6.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url7"
-                        """{"image": "image7.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url8"
-                        """{"image": "image8.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url9"
-                        """{"image": "image9.jpg"}"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "url10"
-                        """{"image": "image10.jpg"}"""
-                    |> expectSuccess
-                        [ ( "elm-pages"
-                          , [ ( get "https://pokeapi.co/api/v2/pokemon/"
-                              , """[{"url":"url1"},{"url":"url2"},{"url":"url3"},{"url":"url4"},{"url":"url5"},{"url":"url6"},{"url":"url7"},{"url":"url8"},{"url":"url9"},{"url":"url10"}]"""
-                              )
-                            , ( get "url1"
-                              , """{"image":"image1.jpg"}"""
-                              )
-                            , ( get "url2"
-                              , """{"image":"image2.jpg"}"""
-                              )
-                            , ( get "url3"
-                              , """{"image":"image3.jpg"}"""
-                              )
-                            , ( get "url4"
-                              , """{"image":"image4.jpg"}"""
-                              )
-                            , ( get "url5"
-                              , """{"image":"image5.jpg"}"""
-                              )
-                            , ( get "url6"
-                              , """{"image":"image6.jpg"}"""
-                              )
-                            , ( get "url7"
-                              , """{"image":"image7.jpg"}"""
-                              )
-                            , ( get "url8"
-                              , """{"image":"image8.jpg"}"""
-                              )
-                            , ( get "url9"
-                              , """{"image":"image9.jpg"}"""
-                              )
-                            , ( get "url10"
-                              , """{"image":"image10.jpg"}"""
-                              )
-                            ]
-                          )
-                        ]
-        , test "port is sent out once all requests are finished" <|
-            \() ->
-                start
-                    [ ( [ "elm-pages" ]
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") starDecoder
-                      )
-                    , ( [ "elm-pages-starter" ]
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages-starter") starDecoder
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 86 }"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages-starter"
-                        """{ "stargazer_count": 22 }"""
-                    |> expectSuccess
-                        [ ( "elm-pages"
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                              , """{"stargazer_count":86}"""
-                              )
-                            ]
-                          )
-                        , ( "elm-pages-starter"
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages-starter"
-                              , """{"stargazer_count":22}"""
-                              )
-                            ]
-                          )
-                        ]
+                    )
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (JsonBody Encode.null)
+                    |> simulateHttp
+                        (get "NEXT-REQUEST")
+                        (JsonBody Encode.null)
+                    |> expectSuccess []
+
+        --, test "andThen chain avoids repeat requests" <|
+        -- TODO is this test case still relevant? Need to think about the new desired functionality with caching HTTP requests given that
+        -- BackendTask's can perform non-deterministic effects now.
+        --    \() ->
+        --        let
+        --            pokemonDetailRequest : BackendTask ()
+        --            pokemonDetailRequest =
+        --                JsonBackendTask.Http.get
+        --                    "https://pokeapi.co/api/v2/pokemon/"
+        --                    (JD.list
+        --                        (JD.field "url" JD.string
+        --                            |> JD.map
+        --                                (\url ->
+        --                                    BackendTask.Http.getJson url
+        --                                        (JD.field "image" JD.string)
+        --                                )
+        --                        )
+        --                    )
+        --                    |> BackendTask.resolve
+        --                    |> BackendTask.map (\_ -> ())
+        --        in
+        --        startSimple
+        --            [ "elm-pages" ]
+        --            pokemonDetailRequest
+        --            |> simulateMultipleHttp
+        --                [ ( get "https://pokeapi.co/api/v2/pokemon/"
+        --                  , jsonBody """[
+        --                    {"url": "url1"},
+        --                    {"url": "url2"},
+        --                    {"url": "url3"},
+        --                    {"url": "url4"},
+        --                    {"url": "url5"},
+        --                    {"url": "url6"},
+        --                    {"url": "url7"},
+        --                    {"url": "url8"},
+        --                    {"url": "url9"},
+        --                    {"url": "url10"}
+        --                    ]"""
+        --                  )
+        --                , ( get "url1"
+        --                  , jsonBody """{"image": "image1.jpg"}"""
+        --                  )
+        --                , ( get "url2"
+        --                  , jsonBody """{"image": "image2.jpg"}"""
+        --                  )
+        --                , ( get "url3"
+        --                  , jsonBody """{"image": "image3.jpg"}"""
+        --                  )
+        --                , ( get "url4"
+        --                  , jsonBody """{"image": "image4.jpg"}"""
+        --                  )
+        --                , ( get "url5"
+        --                  , jsonBody """{"image": "image5.jpg"}"""
+        --                  )
+        --                , ( get "url6"
+        --                  , jsonBody """{"image": "image6.jpg"}"""
+        --                  )
+        --                , ( get "url7"
+        --                  , jsonBody """{"image": "image7.jpg"}"""
+        --                  )
+        --                , ( get "url8"
+        --                  , jsonBody """{"image": "image8.jpg"}"""
+        --                  )
+        --                , ( get "url9"
+        --                  , jsonBody """{"image": "image9.jpg"}"""
+        --                  )
+        --                , ( get "url10"
+        --                  , jsonBody """{"image": "image10.jpg"}"""
+        --                  )
+        --                ]
+        --            |> expectSuccess []
+        --
+        --, test "port is sent out once all requests are finished" <|
+        --    \() ->
+        --        start
+        --            [ ( [ "elm-pages" ]
+        --              , BackendTask.Http.getJson (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") starDecoder
+        --              )
+        --            , ( [ "elm-pages-starter" ]
+        --              , BackendTask.Http.getJson (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages-starter") starDecoder
+        --              )
+        --            ]
+        --            |> ProgramTest.simulateHttpOk
+        --                "GET"
+        --                "https://api.github.com/repos/dillonkearns/elm-pages"
+        --                """{ "stargazer_count": 86 }"""
+        --            |> ProgramTest.simulateHttpOk
+        --                "GET"
+        --                "https://api.github.com/repos/dillonkearns/elm-pages-starter"
+        --                """{ "stargazer_count": 22 }"""
+        --            |> expectSuccess
+        --                [ ( "elm-pages"
+        --                  , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
+        --                      , """{"stargazer_count":86}"""
+        --                      )
+        --                    ]
+        --                  )
+        --                , ( "elm-pages-starter"
+        --                  , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages-starter"
+        --                      , """{"stargazer_count":22}"""
+        --                      )
+        --                    ]
+        --                  )
+        --                ]
         , test "reduced JSON is sent out" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") (Decode.field "stargazer_count" Decode.int)
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 86, "unused_field": 123 }"""
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                              , """{"stargazer_count":86}"""
-                              )
-                            ]
-                          )
-                        ]
+                startSimple []
+                    (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" (JD.field "stargazer_count" JD.int)
+                        |> BackendTask.allowFatal
+                    )
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (jsonBody """{ "stargazer_count": 86, "unused_field": 123 }""")
+                    |> expectSuccess []
         , test "you can use elm/json decoders with StaticHttp.unoptimizedRequest" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.unoptimizedRequest
-                            (Secrets.succeed
-                                { url = "https://api.github.com/repos/dillonkearns/elm-pages"
-                                , method = "GET"
-                                , headers = []
-                                , body = StaticHttp.emptyBody
-                                }
-                            )
-                            (StaticHttp.expectUnoptimizedJson
-                                (JD.field "stargazer_count" JD.int)
-                            )
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 86, "unused_field": 123 }"""
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                              , """{ "stargazer_count": 86, "unused_field": 123 }"""
-                              )
-                            ]
-                          )
-                        ]
+                startSimple []
+                    (BackendTask.Http.request
+                        { url = "https://api.github.com/repos/dillonkearns/elm-pages"
+                        , method = "GET"
+                        , headers = []
+                        , body = BackendTask.Http.emptyBody
+                        , retries = Nothing
+                        , timeoutInMs = Nothing
+                        }
+                        (BackendTask.Http.expectJson
+                            (JD.field "stargazer_count" JD.int)
+                        )
+                        |> BackendTask.allowFatal
+                    )
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (jsonBody """{ "stargazer_count": 86, "unused_field": 123 }""")
+                    |> expectSuccess []
         , test "plain string" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.unoptimizedRequest
-                            (Secrets.succeed
-                                { url = "https://example.com/file.txt"
-                                , method = "GET"
-                                , headers = []
-                                , body = StaticHttp.emptyBody
-                                }
-                            )
-                            (StaticHttp.expectString Ok)
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://example.com/file.txt"
-                        "This is a raw text file."
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( get "https://example.com/file.txt"
-                              , "This is a raw text file."
-                              )
-                            ]
-                          )
-                        ]
+                startSimple []
+                    (BackendTask.Http.request
+                        { url = "https://example.com/file.txt"
+                        , method = "GET"
+                        , headers = []
+                        , body = BackendTask.Http.emptyBody
+                        , retries = Nothing
+                        , timeoutInMs = Nothing
+                        }
+                        BackendTask.Http.expectString
+                        |> BackendTask.allowFatal
+                    )
+                    |> simulateHttp
+                        { method = "GET"
+                        , url = "https://example.com/file.txt"
+                        , headers =
+                            []
+                        , body = BackendTask.Http.emptyBody
+                        , cacheOptions = Nothing
+                        , quiet = False
+                        , env = Dict.empty
+                        , dir = []
+                        }
+                        (StringBody "This is a raw text file.")
+                    |> expectSuccess []
         , test "Err in String to Result function turns into decode error" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.unoptimizedRequest
-                            (Secrets.succeed
-                                { url = "https://example.com/file.txt"
-                                , method = "GET"
-                                , headers = []
-                                , body = StaticHttp.emptyBody
-                                }
-                            )
-                            (StaticHttp.expectString
-                                (\string ->
-                                    if String.toUpper string == string then
-                                        Ok string
+                startSimple []
+                    (BackendTask.Http.request
+                        { url = "https://example.com/file.txt"
+                        , method = "GET"
+                        , headers = []
+                        , body = BackendTask.Http.emptyBody
+                        , retries = Nothing
+                        , timeoutInMs = Nothing
+                        }
+                        BackendTask.Http.expectString
+                        |> BackendTask.allowFatal
+                        |> BackendTask.map
+                            (\string ->
+                                if String.toUpper string == string then
+                                    Ok string
 
-                                    else
-                                        Err "String was not uppercased"
-                                )
+                                else
+                                    Err "String was not uppercased"
                             )
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://example.com/file.txt"
-                        "This is a raw text file."
+                        |> BackendTask.andThen (\result -> result |> Result.mapError FatalError.fromString |> BackendTask.fromResult)
+                    )
+                    |> simulateHttp
+                        (get "https://example.com/file.txt")
+                        (StringBody "This is a raw text file.")
                     |> ProgramTest.expectOutgoingPortValues
                         "toJsPort"
-                        (Codec.decoder ToJsPayload.toJsCodec)
+                        (Codec.decoder (ToJsPayload.successCodecNew2 "" ""))
                         (expectErrorsPort
-                            """-- STATIC HTTP DECODING ERROR ----------------------------------------------------- elm-pages
+                            """-- CUSTOM ERROR ----------------------------------------------------- elm-pages
 
 
 
@@ -347,512 +322,134 @@ String was not uppercased"""
                         )
         , test "POST method works" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.request
-                            (Secrets.succeed
-                                { method = "POST"
-                                , url = "https://api.github.com/repos/dillonkearns/elm-pages"
-                                , headers = []
-                                , body = StaticHttp.emptyBody
-                                }
-                            )
-                            (Decode.field "stargazer_count" Decode.int)
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "POST"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 86, "unused_field": 123 }"""
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( { method = "POST"
-                                , url = "https://api.github.com/repos/dillonkearns/elm-pages"
-                                , headers = []
-                                , body = StaticHttp.emptyBody
-                                }
-                              , """{"stargazer_count":86}"""
-                              )
-                            ]
-                          )
-                        ]
+                startSimple []
+                    (BackendTask.Http.request
+                        { method = "POST"
+                        , url = "https://api.github.com/repos/dillonkearns/elm-pages"
+                        , headers = []
+                        , body = BackendTask.Http.emptyBody
+                        , retries = Nothing
+                        , timeoutInMs = Nothing
+                        }
+                        (BackendTask.Http.expectJson
+                            (JD.field "stargazer_count" JD.int)
+                        )
+                        |> BackendTask.allowFatal
+                    )
+                    |> simulateHttp
+                        (post "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (jsonBody """{ "stargazer_count": 86, "unused_field": 123 }""")
+                    |> expectSuccess []
         , test "json is reduced from andThen chains" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") (Decode.field "stargazer_count" Decode.int)
-                            |> StaticHttp.andThen
-                                (\continueUrl ->
-                                    StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages-starter") (Decode.field "stargazer_count" Decode.int)
-                                )
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 100, "unused_field": 123 }"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages-starter"
-                        """{ "stargazer_count": 50, "unused_field": 456 }"""
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                              , """{"stargazer_count":100}"""
-                              )
-                            , ( get "https://api.github.com/repos/dillonkearns/elm-pages-starter"
-                              , """{"stargazer_count":50}"""
-                              )
-                            ]
-                          )
-                        ]
+                startSimple []
+                    (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" (JD.field "stargazer_count" JD.int)
+                        |> BackendTask.andThen
+                            (\_ ->
+                                BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages-starter" (JD.field "stargazer_count" JD.int)
+                            )
+                        |> BackendTask.allowFatal
+                    )
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (jsonBody """{ "stargazer_count": 100, "unused_field": 123 }""")
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages-starter")
+                        (jsonBody """{ "stargazer_count": 50, "unused_field": 456 }""")
+                    |> expectSuccess []
         , test "reduced json is preserved by StaticHttp.map2" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.map2 (\_ _ -> ())
-                            (StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") (Decode.field "stargazer_count" Decode.int))
-                            (StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages-starter") (Decode.field "stargazer_count" Decode.int))
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 100, "unused_field": 123 }"""
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages-starter"
-                        """{ "stargazer_count": 50, "unused_field": 456 }"""
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                              , """{"stargazer_count":100}"""
-                              )
-                            , ( get "https://api.github.com/repos/dillonkearns/elm-pages-starter"
-                              , """{"stargazer_count":50}"""
-                              )
-                            ]
+                startSimple []
+                    (BackendTask.map2 (\_ _ -> ())
+                        (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" (JD.field "stargazer_count" JD.int) |> BackendTask.allowFatal)
+                        (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages-starter" (JD.field "stargazer_count" JD.int) |> BackendTask.allowFatal)
+                    )
+                    |> simulateMultipleHttp
+                        [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
+                          , jsonBody """{ "stargazer_count": 100, "unused_field": 123 }"""
+                          )
+                        , ( get "https://api.github.com/repos/dillonkearns/elm-pages-starter"
+                          , jsonBody """{ "stargazer_count": 50, "unused_field": 456 }"""
                           )
                         ]
+                    |> expectSuccess []
         , test "the port sends out even if there are no http requests" <|
             \() ->
                 start
                     [ ( []
-                      , StaticHttp.succeed ()
+                      , BackendTask.succeed ()
                       )
                     ]
-                    |> expectSuccess [ ( "", [] ) ]
+                    |> expectSuccess []
         , test "the port sends out when there are duplicate http requests for the same page" <|
             \() ->
-                start
-                    [ ( []
-                      , StaticHttp.map2 (\_ _ -> ())
-                            (StaticHttp.get (Secrets.succeed "http://example.com") (Decode.succeed ()))
-                            (StaticHttp.get (Secrets.succeed "http://example.com") (Decode.succeed ()))
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "http://example.com"
-                        """null"""
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( get "http://example.com"
-                              , """null"""
-                              )
-                            ]
-                          )
-                        ]
+                startSimple []
+                    (BackendTask.map2 (\_ _ -> ())
+                        (BackendTask.Http.getJson "http://example.com" (JD.succeed ()) |> BackendTask.allowFatal)
+                        (BackendTask.Http.getJson "http://example.com" (JD.succeed ()) |> BackendTask.allowFatal)
+                    )
+                    |> simulateHttp
+                        (get "http://example.com")
+                        (jsonBody """null""")
+                    |> expectSuccess []
         , test "an error is sent out for decoder failures" <|
             \() ->
-                start
-                    [ ( [ "elm-pages" ]
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") (Decode.fail "The user should get this message from the CLI.")
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        """{ "stargazer_count": 86 }"""
+                startSimple [ "elm-pages" ]
+                    (BackendTask.Http.getJson "https://api.github.com/repos/dillonkearns/elm-pages" (JD.fail "The user should get this message from the CLI.") |> BackendTask.allowFatal)
+                    |> simulateHttp
+                        (get "https://api.github.com/repos/dillonkearns/elm-pages")
+                        (jsonBody """{ "stargazer_count": 86 }""")
                     |> ProgramTest.expectOutgoingPortValues
                         "toJsPort"
-                        (Codec.decoder ToJsPayload.toJsCodec)
+                        (Codec.decoder (ToJsPayload.successCodecNew2 "" ""))
                         (expectErrorsPort
-                            """-- STATIC HTTP DECODING ERROR ----------------------------------------------------- elm-pages
+                            """-- HTTP ERROR ----------------------------------------------------- elm-pages
 
-elm-pages
+BadBody: Problem with the given value:
 
-I encountered some errors while decoding this JSON:
+{
+   "stargazer_count": 86
+}
 
-  The user should get this message from the CLI.
-
-    {
-      "stargazer_count": 86
-    }"""
+The user should get this message from the CLI."""
                         )
-        , test "an error is sent for missing secrets from continuation requests" <|
-            \() ->
-                start
-                    [ ( [ "elm-pages" ]
-                      , StaticHttp.get
-                            (Secrets.succeed
-                                (\apiKey ->
-                                    "https://api.github.com/repos/dillonkearns/elm-pages?apiKey=" ++ apiKey
-                                )
-                                |> Secrets.with "API_KEY"
-                            )
-                            Decode.string
-                            |> StaticHttp.andThen
-                                (\url ->
-                                    StaticHttp.get
-                                        (Secrets.succeed
-                                            (\missingSecret ->
-                                                url ++ "?apiKey=" ++ missingSecret
-                                            )
-                                            |> Secrets.with "MISSING"
-                                        )
-                                        (Decode.succeed ())
-                                )
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpOk
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages?apiKey=ABCD1234"
-                        """ "continuation-url" """
-                    |> ProgramTest.expectOutgoingPortValues
-                        "toJsPort"
-                        (Codec.decoder ToJsPayload.toJsCodec)
-                        (expectErrorsPort
-                            """-- MISSING SECRET ----------------------------------------------------- elm-pages
-
-I expected to find this Secret in your environment variables but didn't find a match:
-
-Secrets.get "MISSING"
-             ^^^^^^^
-
-So maybe MISSING should be API_KEY"""
-                        )
-        , test "an error is sent for HTTP errors" <|
-            \() ->
-                start
-                    [ ( []
-                      , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") (Decode.succeed ())
-                      )
-                    ]
-                    |> ProgramTest.simulateHttpResponse
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages"
-                        (Test.Http.httpResponse
-                            { statusCode = 404
-                            , headers = []
-                            , body = ""
-                            }
-                        )
-                    |> ProgramTest.expectOutgoingPortValues
-                        "toJsPort"
-                        (Codec.decoder ToJsPayload.toJsCodec)
-                        (expectErrorsPort """-- STATIC HTTP ERROR ----------------------------------------------------- elm-pages
-
-I got an error making an HTTP request to this URL: https://api.github.com/repos/dillonkearns/elm-pages
-
-Bad status: 404
-Status message: TODO: if you need this, please report to https://github.com/avh4/elm-program-test/issues
-Body: """)
-        , test "uses real secrets to perform request and masked secrets to store and lookup response" <|
-            \() ->
-                start
-                    [ ( []
-                      , StaticHttp.request
-                            (Secrets.succeed
-                                (\apiKey bearer ->
-                                    { url = "https://api.github.com/repos/dillonkearns/elm-pages?apiKey=" ++ apiKey
-                                    , method = "GET"
-                                    , headers = [ ( "Authorization", "Bearer " ++ bearer ) ]
-                                    , body = StaticHttp.emptyBody
-                                    }
-                                )
-                                |> Secrets.with "API_KEY"
-                                |> Secrets.with "BEARER"
-                            )
-                            (Decode.succeed ())
-                      )
-                    ]
-                    |> ProgramTest.ensureHttpRequest "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages?apiKey=ABCD1234"
-                        (\request ->
-                            request.headers
-                                |> Expect.equal [ ( "Authorization", "Bearer XYZ789" ) ]
-                        )
-                    |> ProgramTest.simulateHttpResponse
-                        "GET"
-                        "https://api.github.com/repos/dillonkearns/elm-pages?apiKey=ABCD1234"
-                        (Test.Http.httpResponse
-                            { statusCode = 200
-                            , headers = []
-                            , body = """{ "stargazer_count": 86 }"""
-                            }
-                        )
-                    |> expectSuccess
-                        [ ( ""
-                          , [ ( { method = "GET"
-                                , url = "https://api.github.com/repos/dillonkearns/elm-pages?apiKey=<API_KEY>"
-                                , headers =
-                                    [ ( "Authorization", "Bearer <BEARER>" )
-                                    ]
-                                , body = StaticHttp.emptyBody
-                                }
-                              , """{}"""
-                              )
-                            ]
-                          )
-                        ]
-        , describe "staticHttpCache"
-            [ test "it doesn't perform http requests that are provided in the http cache flag" <|
-                \() ->
-                    startWithHttpCache (Ok ())
-                        [ ( { url = "https://api.github.com/repos/dillonkearns/elm-pages"
-                            , method = "GET"
-                            , headers = []
-                            , body = StaticHttpBody.EmptyBody
-                            }
-                          , """{"stargazer_count":86}"""
-                          )
-                        ]
-                        [ ( []
-                          , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") starDecoder
-                          )
-                        ]
-                        |> expectSuccess
-                            [ ( ""
-                              , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                                  , """{"stargazer_count":86}"""
-                                  )
-                                ]
-                              )
-                            ]
-            , test "it ignores unused cache" <|
-                \() ->
-                    startWithHttpCache (Ok ())
-                        [ ( { url = "https://this-is-never-used.example.com/"
-                            , method = "GET"
-                            , headers = []
-                            , body = StaticHttpBody.EmptyBody
-                            }
-                          , """{"stargazer_count":86}"""
-                          )
-                        ]
-                        [ ( []
-                          , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") starDecoder
-                          )
-                        ]
-                        |> ProgramTest.simulateHttpOk
-                            "GET"
-                            "https://api.github.com/repos/dillonkearns/elm-pages"
-                            """{ "stargazer_count": 86 }"""
-                        |> expectSuccess
-                            [ ( ""
-                              , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                                  , """{"stargazer_count":86}"""
-                                  )
-                                ]
-                              )
-                            ]
-            ]
-        , describe "document parsing errors"
-            [ test "fails the build when there is an error" <|
-                \() ->
-                    startWithHttpCache (Err "Found an unhandled HTML tag in markdown doc.")
-                        []
-                        [ ( []
-                          , StaticHttp.succeed ()
-                          )
-                        ]
-                        |> expectError
-                            [ """-- METADATA DECODE ERROR ----------------------------------------------------- elm-pages
-
-I ran into a problem when parsing the metadata for the page with this path: 
-
-Found an unhandled HTML tag in markdown doc."""
-                            ]
-            ]
-        , describe "generateFiles"
-            [ test "initial requests are sent out" <|
-                \() ->
-                    startLowLevel
-                        (StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages")
-                            (starDecoder
-                                |> Decode.map
-                                    (\starCount ->
-                                        [ Ok
-                                            { path = [ "test.txt" ]
-                                            , content = "Star count: " ++ String.fromInt starCount
-                                            }
-                                        ]
-                                    )
-                            )
-                        )
-                        (Ok ())
-                        []
-                        []
-                        |> ProgramTest.simulateHttpOk
-                            "GET"
-                            "https://api.github.com/repos/dillonkearns/elm-pages"
-                            """{ "stargazer_count": 86 }"""
-                        |> expectSuccessNew
-                            []
-                            [ \success ->
-                                success.filesToGenerate
-                                    |> Expect.equal
-                                        [ { path = [ "test.txt" ]
-                                          , content = "Star count: 86"
-                                          }
-                                        ]
-                            ]
-            , test "it sends success port when no HTTP requests are needed because they're all cached" <|
-                \() ->
-                    startLowLevel
-                        (StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages-starter")
-                            (starDecoder
-                                |> Decode.map
-                                    (\starCount ->
-                                        [ Ok
-                                            { path = [ "test.txt" ]
-                                            , content = "Star count: " ++ String.fromInt starCount
-                                            }
-                                        ]
-                                    )
-                            )
-                        )
-                        (Ok ())
-                        [ ( { url = "https://api.github.com/repos/dillonkearns/elm-pages"
-                            , method = "GET"
-                            , headers = []
-                            , body = StaticHttpBody.EmptyBody
-                            }
-                          , """{"stargazer_count":86}"""
-                          )
-                        , ( { url = "https://api.github.com/repos/dillonkearns/elm-pages-starter"
-                            , method = "GET"
-                            , headers = []
-                            , body = StaticHttpBody.EmptyBody
-                            }
-                          , """{"stargazer_count":23}"""
-                          )
-                        ]
-                        [ ( []
-                          , StaticHttp.get (Secrets.succeed "https://api.github.com/repos/dillonkearns/elm-pages") starDecoder
-                          )
-                        ]
-                        |> expectSuccessNew
-                            [ ( ""
-                              , [ ( get "https://api.github.com/repos/dillonkearns/elm-pages"
-                                  , """{"stargazer_count":86}"""
-                                  )
-                                ]
-                              )
-                            ]
-                            [ \success ->
-                                success.filesToGenerate
-                                    |> Expect.equal
-                                        [ { path = [ "test.txt" ]
-                                          , content = "Star count: 23"
-                                          }
-                                        ]
-                            ]
-            ]
         ]
 
 
-start : List ( List String, StaticHttp.Request a ) -> ProgramTest Main.Model Main.Msg (Effect PathKey)
+type Route
+    = Route String
+
+
+start : List ( List String, BackendTask FatalError a ) -> ProgramTest (Model Route) Msg Effect
 start pages =
-    startWithHttpCache (Ok ()) [] pages
+    startWithHttpCache [] pages
 
 
 startWithHttpCache :
-    Result String ()
-    -> List ( Request.Request, String )
-    -> List ( List String, StaticHttp.Request a )
-    -> ProgramTest Main.Model Main.Msg (Effect PathKey)
+    List ( Request.Request, String )
+    -> List ( List String, BackendTask FatalError a )
+    -> ProgramTest (Model Route) Msg Effect
 startWithHttpCache =
-    startLowLevel (StaticHttp.succeed [])
+    startLowLevel []
 
 
 startLowLevel :
-    StaticHttp.Request
-        (List
-            (Result String
-                { path : List String
-                , content : String
-                }
-            )
-        )
-    -> Result String ()
+    List (ApiRoute.ApiRoute ApiRoute.Response)
     -> List ( Request.Request, String )
-    -> List ( List String, StaticHttp.Request a )
-    -> ProgramTest Main.Model Main.Msg (Effect PathKey)
-startLowLevel generateFiles documentBodyResult staticHttpCache pages =
+    -> List ( List String, BackendTask FatalError a )
+    -> ProgramTest (Model Route) Msg Effect
+startLowLevel apiRoutes _ pages =
     let
-        document =
-            Document.fromList
-                [ Document.parser
-                    { extension = "md"
-                    , metadata = JD.succeed ()
-                    , body = \_ -> documentBodyResult
-                    }
-                ]
+        pageToLoad : List String
+        pageToLoad =
+            case pages |> List.head |> Maybe.map Tuple.first of
+                Just justPageToLoad ->
+                    justPageToLoad
 
-        content =
-            pages
-                |> List.map
-                    (\( path, _ ) ->
-                        ( path, { extension = "md", frontMatter = "null", body = Just "" } )
-                    )
+                Nothing ->
+                    Debug.todo "Error - no pages"
 
-        contentCache =
-            ContentCache.init document content Nothing
-
-        siteMetadata =
-            contentCache
-                |> Result.map
-                    (\cache -> cache |> ContentCache.extractMetadata PathKey)
-                |> Result.mapError (List.map Tuple.second)
-
-        config =
-            { toJsPort = toJsPort
-            , fromJsPort = fromJsPort
-            , manifest = manifest
-            , generateFiles = \_ -> generateFiles
-            , init = \_ -> ( (), Cmd.none )
-            , update = \_ _ -> ( (), Cmd.none )
-            , view =
-                \allFrontmatter page ->
-                    let
-                        thing =
-                            pages
-                                |> Dict.fromList
-                                |> Dict.get
-                                    (page.path
-                                        |> PagePath.toString
-                                        |> String.split "/"
-                                        |> List.filter (\pathPart -> pathPart /= "")
-                                    )
-                    in
-                    case thing of
-                        Just request ->
-                            request
-                                |> StaticHttp.map
-                                    (\staticData -> { view = \model viewForPage -> { title = "Title", body = Html.text "" }, head = [] })
-
-                        Nothing ->
-                            Debug.todo "Couldn't find page"
-            , subscriptions = \_ -> Sub.none
-            , document = document
-            , content = []
-            , canonicalSiteUrl = ""
-            , pathKey = PathKey
-            , onPageChange = Just (\_ -> ())
-            }
-
+        encodedFlags : Encode.Value
         encodedFlags =
             --{"secrets":
             --        {"API_KEY": "ABCD1234","BEARER": "XYZ789"}, "mode": "prod", "staticHttpCache": {}
@@ -866,31 +463,186 @@ startLowLevel generateFiles documentBodyResult staticHttpCache pages =
                         |> Encode.dict identity Encode.string
                   )
                 , ( "mode", Encode.string "prod" )
-                , ( "staticHttpCache", encodedStaticHttpCache )
+                , ( "compatibilityKey", Encode.int currentCompatibilityKey )
                 ]
-
-        encodedStaticHttpCache =
-            staticHttpCache
-                |> List.map
-                    (\( request, httpResponseString ) ->
-                        ( Request.hash request, Encode.string httpResponseString )
-                    )
-                |> Encode.object
     in
     {-
        (Model -> model)
        -> ContentCache.ContentCache metadata view
-       -> Result (List BuildError) (List ( PagePath pathKey, metadata ))
+       -> Result (List BuildError) (List ( PagePath, metadata ))
        -> Config pathKey userMsg userModel metadata view
        -> Decode.Value
        -> ( model, Effect pathKey )
     -}
     ProgramTest.createDocument
-        { init = Main.init identity contentCache siteMetadata config
-        , update = Main.update siteMetadata config
+        { init =
+            init
+                site
+                (RenderRequest.SinglePage
+                    RenderRequest.OnlyJson
+                    (RenderRequest.Page
+                        { path = UrlPath.fromString (pageToLoad |> String.join "/")
+                        , frontmatter = Route (pageToLoad |> String.join "/")
+                        }
+                    )
+                    (Encode.object [])
+                )
+                (config apiRoutes pages)
+        , update = update
         , view = \_ -> { title = "", body = [] }
         }
         |> ProgramTest.withSimulatedEffects simulateEffects
+        |> ProgramTest.start (flags (Encode.encode 0 encodedFlags))
+
+
+site : SiteConfig
+site =
+    { canonicalUrl = "canonical-site-url"
+    , head = BackendTask.succeed []
+    }
+
+
+startSimple : List String -> BackendTask FatalError a -> ProgramTest (Model Route) Msg Effect
+startSimple route backendTasks =
+    startWithRoutes route [ ( route, backendTasks ) ]
+
+
+config : List (ApiRoute.ApiRoute ApiRoute.Response) -> List ( List String, BackendTask FatalError a ) -> ProgramConfig Msg () Route () () () Effect mappedMsg ()
+config apiRoutes pages =
+    { toJsPort = toJsPort
+    , fromJsPort = fromJsPort
+    , init = \_ _ _ _ _ -> ( (), Effect.NoEffect )
+    , getStaticRoutes =
+        --StaticHttp.get (Secrets.succeed "https://my-cms.com/posts")
+        --    (Decode.field "posts" (Decode.list (Decode.string |> Decode.map Route)))
+        pages
+            |> List.map Tuple.first
+            |> List.map (String.join "/")
+            |> List.map Route
+            |> BackendTask.succeed
+    , handleRoute = \_ -> BackendTask.succeed Nothing
+    , urlToRoute = .path >> Route
+    , update = \_ _ _ _ _ _ _ _ -> ( (), Effect.NoEffect )
+    , basePath = []
+    , onActionData = \() -> Nothing
+    , data =
+        \_ (Route pageRoute) ->
+            let
+                thing : Maybe (BackendTask FatalError a)
+                thing =
+                    pages
+                        |> Dict.fromList
+                        |> Dict.get
+                            (pageRoute
+                                |> String.split "/"
+                                |> List.filter (\pathPart -> pathPart /= "")
+                            )
+            in
+            case thing of
+                Just request ->
+                    request |> BackendTask.map (\_ -> Response.render ())
+
+                Nothing ->
+                    Debug.todo <| "Couldn't find page: " ++ pageRoute ++ "\npages: " ++ Debug.toString pages
+    , site = Just site
+    , view =
+        \_ _ _ page _ _ _ _ ->
+            let
+                thing : Maybe (BackendTask FatalError a)
+                thing =
+                    pages
+                        |> Dict.fromList
+                        |> Dict.get page.path
+            in
+            case thing of
+                Just _ ->
+                    { view = \_ -> { title = "Title", body = [ Html.text "" ] }, head = [] }
+
+                Nothing ->
+                    Debug.todo <| "Couldn't find page: " ++ Debug.toString page ++ "\npages: " ++ Debug.toString pages
+    , subscriptions = \_ _ _ -> Sub.none
+    , routeToPath = \(Route route) -> route |> String.split "/"
+    , sharedData = BackendTask.succeed ()
+    , onPageChange = \_ -> GotDataBatch []
+    , apiRoutes = \_ -> apiRoutes
+    , pathPatterns = []
+    , byteDecodePageData = \_ -> Bytes.Decode.fail
+    , sendPageData = \_ -> Cmd.none
+    , encodeResponse = \_ -> Bytes.Encode.signedInt8 0
+    , hotReloadData = Sub.none
+    , pageDataFromJs = Sub.none
+    , decodeResponse = Bytes.Decode.fail
+    , byteEncodePageData = \_ -> Bytes.Encode.signedInt8 0
+    , gotBatchSub = Sub.none
+    , globalHeadTags = Nothing
+    , perform = \_ _ -> Cmd.none
+    , cmdToEffect = \_ -> Effect.NoEffect
+    , errorStatusCode = \_ -> 404
+    , notFoundPage = ()
+    , notFoundRoute = Route "not-found"
+    , internalError = \_ -> ()
+    , errorPageToData = \_ -> ()
+    , action = \_ _ -> BackendTask.fail (FatalError.fromString "No action.")
+    , encodeAction = \_ -> Bytes.Encode.signedInt8 0
+    , pageModelToString = \_ -> ""
+    }
+
+
+startWithRoutes :
+    List String
+    -> List ( List String, BackendTask FatalError a )
+    -> ProgramTest (Model Route) Msg Effect
+startWithRoutes pageToLoad pages =
+    let
+        encodedFlags : Encode.Value
+        encodedFlags =
+            --{"secrets":
+            --        {"API_KEY": "ABCD1234","BEARER": "XYZ789"}, "mode": "prod", "staticHttpCache": {}
+            --        }
+            Encode.object
+                [ ( "secrets"
+                  , [ ( "API_KEY", "ABCD1234" )
+                    , ( "BEARER", "XYZ789" )
+                    ]
+                        |> Dict.fromList
+                        |> Encode.dict identity Encode.string
+                  )
+                , ( "staticHttpCache", encodedStaticHttpCache )
+                , ( "mode", Encode.string "dev-server" )
+                , ( "compatibilityKey", Encode.int currentCompatibilityKey )
+                ]
+
+        encodedStaticHttpCache : Encode.Value
+        encodedStaticHttpCache =
+            [] |> Encode.object
+    in
+    {-
+       (Model -> model)
+       -> ContentCache.ContentCache metadata view
+       -> Result (List BuildError) (List ( PagePath, metadata ))
+       -> Config pathKey userMsg userModel metadata view
+       -> Decode.Value
+       -> ( model, Effect pathKey )
+    -}
+    ProgramTest.createDocument
+        { init =
+            init
+                site
+                (RenderRequest.SinglePage
+                    RenderRequest.OnlyJson
+                    (RenderRequest.Page
+                        { path = UrlPath.fromString (pageToLoad |> String.join "/")
+                        , frontmatter = Route (pageToLoad |> String.join "/")
+                        }
+                    )
+                    (Encode.object [])
+                )
+                (config [] pages)
+        , update = update
+        , view = \_ -> { title = "", body = [] }
+        }
+        |> ProgramTest.withSimulatedEffects simulateEffects
+        |> ProgramTest.withSimulatedSubscriptions simulateSubscriptions
         |> ProgramTest.start (flags (Encode.encode 0 encodedFlags))
 
 
@@ -904,14 +656,16 @@ flags jsonString =
             Debug.todo "Invalid JSON value."
 
 
-simulateEffects : Effect PathKey -> ProgramTest.SimulatedEffect Main.Msg
+sendToJsPort : ToJsPayload.ToJsSuccessPayloadNewCombined -> ProgramTest.SimulatedEffect msg
+sendToJsPort value =
+    SimulatedEffect.Ports.send "toJsPort" (value |> Codec.encoder (ToJsPayload.successCodecNew2 "" ""))
+
+
+simulateEffects : Effect -> ProgramTest.SimulatedEffect Msg
 simulateEffects effect =
     case effect of
         Effect.NoEffect ->
             SimulatedEffect.Cmd.none
-
-        Effect.SendJsData value ->
-            SimulatedEffect.Ports.send "toJsPort" (value |> Codec.encoder ToJsPayload.toJsCodec)
 
         --            toJsPort value |> Cmd.map never
         Effect.Batch list ->
@@ -919,177 +673,147 @@ simulateEffects effect =
                 |> List.map simulateEffects
                 |> SimulatedEffect.Cmd.batch
 
-        Effect.FetchHttp ({ unmasked, masked } as requests) ->
-            Http.request
-                { method = unmasked.method
-                , url = unmasked.url
-                , headers = unmasked.headers |> List.map (\( key, value ) -> Http.header key value)
-                , body =
-                    case unmasked.body of
-                        StaticHttpBody.EmptyBody ->
-                            Http.emptyBody
+        Effect.FetchHttp requests ->
+            requests
+                |> List.map
+                    (\request -> ( Request.hash request, request ))
+                |> ToJsPayload.DoHttp
+                |> sendToJsPort
+                |> SimulatedEffect.Cmd.map never
 
-                        StaticHttpBody.StringBody contentType string ->
-                            Http.stringBody contentType string
+        Effect.SendSinglePage info ->
+            SimulatedEffect.Cmd.batch
+                [ info
+                    |> Codec.encoder (ToJsPayload.successCodecNew2 "" "")
+                    |> SimulatedEffect.Ports.send "toJsPort"
+                , SimulatedEffect.Cmd.none
+                ]
 
-                        StaticHttpBody.JsonBody value ->
-                            Http.jsonBody value
-                , expect =
-                    PagesHttp.expectString
-                        (\response ->
-                            GotStaticHttpResponse
-                                { request = requests
-                                , response = response
-                                }
-                        )
-                , timeout = Nothing
-                , tracker = Nothing
-                }
+        Effect.SendSinglePageNew _ toJsSuccessPayloadNewCombined ->
+            SimulatedEffect.Cmd.batch
+                [ toJsSuccessPayloadNewCombined
+                    |> Codec.encoder (ToJsPayload.successCodecNew2 "" "")
+                    |> SimulatedEffect.Ports.send "toJsPort"
+                , SimulatedEffect.Cmd.none
+                ]
 
 
-expectErrorsPort : String -> List (ToJsPayload pathKey) -> Expect.Expectation
+expectErrorsPort : String -> List ToJsPayload.ToJsSuccessPayloadNewCombined -> Expect.Expectation
 expectErrorsPort expectedPlainString actualPorts =
-    case actualPorts of
-        [ ToJsPayload.Errors actualRichTerminalString ] ->
+    case actualPorts |> List.reverse |> List.head of
+        Just (ToJsPayload.Errors actualRichTerminalString) ->
             actualRichTerminalString
+                |> List.map .title
+                |> String.join "\n"
                 |> normalizeErrorExpectEqual expectedPlainString
+
+        Nothing ->
+            Expect.fail "Expected single error port. Didn't receive any ports."
 
         _ ->
             Expect.fail <| "Expected single error port. Got\n" ++ String.join "\n\n" (List.map Debug.toString actualPorts)
-
-
-expectNonfatalErrorsPort : String -> List (ToJsPayload pathKey) -> Expect.Expectation
-expectNonfatalErrorsPort expectedPlainString actualPorts =
-    case actualPorts of
-        [ ToJsPayload.Success successPayload ] ->
-            successPayload.errors
-                |> String.join "\n\n"
-                |> normalizeErrorExpectEqual expectedPlainString
-
-        _ ->
-            Expect.fail <| "Expected single non-fatal error port. Got\n" ++ String.join "\n\n" (List.map Debug.toString actualPorts)
 
 
 normalizeErrorExpectEqual : String -> String -> Expect.Expectation
 normalizeErrorExpectEqual expectedPlainString actualRichTerminalString =
     actualRichTerminalString
         |> Regex.replace
-            (Regex.fromString "\u{001B}\\[[0-9;]+m"
+            -- strip out all possible ANSI sequences
+            (Regex.fromString "(\\x9B|\\x1B\\[)[0-?]*[ -/]*[@-~]"
                 |> Maybe.withDefault Regex.never
             )
             (\_ -> "")
-        |> Expect.equal expectedPlainString
+        |> String.replace "\u{001B}" ""
+        |> normalizeNewlines
+        |> Expect.equal
+            (expectedPlainString |> normalizeNewlines)
 
 
-normalizeErrorsExpectEqual : List String -> List String -> Expect.Expectation
-normalizeErrorsExpectEqual expectedPlainStrings actualRichTerminalStrings =
-    actualRichTerminalStrings
-        |> List.map
-            (Regex.replace
-                (Regex.fromString "\u{001B}\\[[0-9;]+m"
-                    |> Maybe.withDefault Regex.never
-                )
-                (\_ -> "")
-            )
-        |> Expect.equalLists expectedPlainStrings
+normalizeNewlines : String -> String
+normalizeNewlines string =
+    string
+        |> Regex.replace
+            (Regex.fromString "(\n)+" |> Maybe.withDefault Regex.never)
+            (\_ -> "")
+        |> Regex.replace
+            (Regex.fromString "( )+" |> Maybe.withDefault Regex.never)
+            (\_ -> " ")
+        |> String.replace "\u{000D}" ""
+        |> Regex.replace
+            (Regex.fromString "\\s" |> Maybe.withDefault Regex.never)
+            (\_ -> "")
 
 
-toJsPort foo =
+toJsPort : a -> Cmd msg
+toJsPort _ =
     Cmd.none
 
 
+fromJsPort : Sub msg
 fromJsPort =
     Sub.none
 
 
-type PathKey
-    = PathKey
-
-
-manifest : Manifest.Config PathKey
-manifest =
-    { backgroundColor = Nothing
-    , categories = []
-    , displayMode = Manifest.Standalone
-    , orientation = Manifest.Portrait
-    , description = "elm-pages - A statically typed site generator."
-    , iarcRatingId = Nothing
-    , name = "elm-pages docs"
-    , themeColor = Nothing
-    , startUrl = PagePath.external ""
-    , shortName = Just "elm-pages"
-    , sourceIcon = ImagePath.external ""
-    }
-
-
 starDecoder : Decoder Int
 starDecoder =
-    Decode.field "stargazer_count" Decode.int
+    JD.field "stargazer_count" JD.int
 
 
-expectSuccess : List ( String, List ( Request.Request, String ) ) -> ProgramTest model msg effect -> Expect.Expectation
+expectSuccess : List ( Request.Request, String ) -> ProgramTest model msg effect -> Expect.Expectation
 expectSuccess expectedRequests previous =
     expectSuccessNew expectedRequests [] previous
 
 
-expectSuccessNew : List ( String, List ( Request.Request, String ) ) -> List (ToJsPayload.ToJsSuccessPayload PathKey -> Expect.Expectation) -> ProgramTest model msg effect -> Expect.Expectation
-expectSuccessNew expectedRequests expectations previous =
+expectSuccessNew : List ( Request.Request, String ) -> List (ToJsPayload.ToJsSuccessPayloadNew -> Expect.Expectation) -> ProgramTest model msg effect -> Expect.Expectation
+expectSuccessNew expectedRequest expectations previous =
     previous
         |> ProgramTest.expectOutgoingPortValues
             "toJsPort"
-            (Codec.decoder ToJsPayload.toJsCodec)
+            (Codec.decoder (ToJsPayload.successCodecNew2 "" ""))
             (\value ->
                 case value of
-                    (ToJsPayload.Success portPayload) :: rest ->
-                        portPayload
-                            |> Expect.all
-                                ((\subject ->
-                                    subject.pages
-                                        |> Expect.equalDicts
-                                            (expectedRequests
+                    (ToJsPayload.PageProgress portPayload) :: _ ->
+                        let
+                            singleExpectation : ToJsPayload.ToJsSuccessPayloadNew -> Expect.Expectation
+                            singleExpectation =
+                                \subject ->
+                                    subject.contentJson
+                                        |> Expect.equal
+                                            (expectedRequest
                                                 |> List.map
-                                                    (\( url, requests ) ->
-                                                        ( url
-                                                        , requests
-                                                            |> List.map
-                                                                (\( request, response ) ->
-                                                                    ( Request.hash request, response )
-                                                                )
-                                                            |> Dict.fromList
-                                                        )
+                                                    (\( request, response ) ->
+                                                        ( Request.hash request, response )
                                                     )
                                                 |> Dict.fromList
                                             )
-                                 )
+                        in
+                        portPayload
+                            |> Expect.all
+                                (singleExpectation
                                     :: expectations
                                 )
 
-                    [ _ ] ->
-                        Expect.fail "Expected success port."
+                    [ errorPort ] ->
+                        Expect.fail <| "Expected success port. Got:\n" ++ Debug.toString errorPort
 
                     _ ->
                         Expect.fail ("Expected ports to be called once, but instead there were " ++ String.fromInt (List.length value) ++ " calls.")
             )
 
 
-expectError : List String -> ProgramTest model msg effect -> Expect.Expectation
-expectError expectedErrors previous =
-    previous
-        |> ProgramTest.expectOutgoingPortValues
-            "toJsPort"
-            (Codec.decoder ToJsPayload.toJsCodec)
-            (\value ->
-                case value of
-                    [ ToJsPayload.Success portPayload ] ->
-                        portPayload.errors
-                            |> normalizeErrorsExpectEqual expectedErrors
-
-                    [ _ ] ->
-                        Expect.fail "Expected success port."
-
-                    _ ->
-                        Expect.fail ("Expected ports to be called once, but instead there were " ++ String.fromInt (List.length value) ++ " calls.")
+simulateSubscriptions : a -> ProgramTest.SimulatedSub Msg
+simulateSubscriptions _ =
+    -- TODO handle build errors or not needed?
+    SimulatedEffect.Ports.subscribe "gotBatchSub"
+        (JD.list
+            (JD.map2
+                (\key json -> { key = key, json = json, bytes = Nothing })
+                (JD.field "key" JD.string)
+                (JD.field "json" JD.value)
             )
+            |> JD.map GotDataBatch
+        )
+        identity
 
 
 get : String -> Request.Request
@@ -1097,5 +821,117 @@ get url =
     { method = "GET"
     , url = url
     , headers = []
-    , body = StaticHttp.emptyBody
+    , body = BackendTask.Http.emptyBody
+    , cacheOptions = Nothing
+    , quiet = False
+    , env = Dict.empty
+    , dir = []
+    }
+
+
+post : String -> Request.Request
+post url =
+    { method = "POST"
+    , url = url
+    , headers = []
+    , body = BackendTask.Http.emptyBody
+    , cacheOptions = Nothing
+    , quiet = False
+    , env = Dict.empty
+    , dir = []
+    }
+
+
+simulateHttp : Request.Request -> ResponseBody -> ProgramTest model msg effect -> ProgramTest model msg effect
+simulateHttp request response program =
+    program
+        |> ProgramTest.ensureOutgoingPortValues
+            "toJsPort"
+            (Codec.decoder (ToJsPayload.successCodecNew2 "" ""))
+            (\actualPorts ->
+                case actualPorts of
+                    [ ToJsPayload.DoHttp _ ] ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail <|
+                            "Expected an HTTP request, got:\n"
+                                ++ Debug.toString actualPorts
+            )
+        |> ProgramTest.simulateIncomingPort "gotBatchSub"
+            (Encode.list encodeBatchEntry [ ( request, response ) ])
+
+
+simulateMultipleHttp : List ( Request.Request, ResponseBody ) -> ProgramTest model msg effect -> ProgramTest model msg effect
+simulateMultipleHttp requests program =
+    program
+        |> ProgramTest.ensureOutgoingPortValues
+            "toJsPort"
+            (Codec.decoder (ToJsPayload.successCodecNew2 "" ""))
+            (\actualPorts ->
+                case actualPorts of
+                    (ToJsPayload.DoHttp _) :: _ ->
+                        -- TODO check count of HTTP requests, and check the URLs
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail <|
+                            "Expected an HTTP request, got:\n"
+                                ++ Debug.toString actualPorts
+            )
+        |> ProgramTest.simulateIncomingPort "gotBatchSub"
+            (Encode.list encodeBatchEntry requests)
+
+
+jsonBody : String -> ResponseBody
+jsonBody jsonString =
+    JsonBody
+        (jsonString
+            |> JD.decodeString JD.value
+            |> Result.withDefault Encode.null
+        )
+
+
+encodeBatchEntry : ( Request.Request, ResponseBody ) -> Encode.Value
+encodeBatchEntry ( req, response ) =
+    let
+        key : String
+        key =
+            Request.hash (req |> withInternalHeader response)
+    in
+    Encode.object
+        [ ( "key", Encode.string key )
+        , ( "json"
+          , Encode.object
+                [ ( "request"
+                  , Codec.encodeToValue Request.codec
+                        (withInternalHeader response req)
+                  )
+                , ( "response"
+                  , RequestsAndPending.bodyEncoder response
+                  )
+                ]
+          )
+        ]
+
+
+withInternalHeader : ResponseBody -> { a | headers : List ( String, String ) } -> { a | headers : List ( String, String ) }
+withInternalHeader res req =
+    { req
+        | headers =
+            ( "elm-pages-internal"
+            , case res of
+                JsonBody _ ->
+                    "ExpectJson"
+
+                BytesBody _ ->
+                    "ExpectBytes"
+
+                StringBody _ ->
+                    "ExpectString"
+
+                WhateverBody ->
+                    "ExpectWhatever"
+            )
+                :: req.headers
     }

@@ -1,174 +1,51 @@
 # `elm-pages` [![Netlify Status](https://api.netlify.com/api/v1/badges/8ee4a674-4f37-4f16-b99e-607c0a02ee75/deploy-status)](https://app.netlify.com/sites/elm-pages/deploys) [![Build Status](https://github.com/dillonkearns/elm-pages/workflows/Elm%20CI/badge.svg)](https://github.com/dillonkearns/elm-pages/actions?query=branch%3Amaster) [![npm](https://img.shields.io/npm/v/elm-pages.svg)](https://npmjs.com/package/elm-pages) [![Elm package](https://img.shields.io/elm-package/v/dillonkearns/elm-pages.svg)](https://package.elm-lang.org/packages/dillonkearns/elm-pages/latest/)
 
-<!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-5-orange.svg?style=flat-square)](#contributors-)
-<!-- ALL-CONTRIBUTORS-BADGE:END -->
-
 [![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/dillonkearns/elm-pages-starter)
 
-A **statically typed** site generator, written with pure Elm.
+`elm-pages` is a framework for building an Elm single-page app that is able to seamlessly interface with data from an Elm Backend. `elm-pages` is a hybrid framework, allowing you to define Routes that are either server-rendered
+(for more dynamic content with user-specific or request-specific data) or pre-rendered at build-time (for generating static HTML files that are hosted through a CDN). You can mix and match server-rendered and pre-rendered routes in your app.
+
+`elm-pages` also has a command for running pure Elm scripts with a single command. See the [elm-pages Scripts docs page](https://elm-pages-v3.netlify.app/docs/elm-pages-scripts).
+
+## What's new in 12.2
+
+- **[`Tui`](https://package.elm-lang.org/packages/dillonkearns/elm-pages/12.3.0/Tui/)** — build interactive terminal apps as elm-pages scripts. TEA-style `init`/`update`/`view` that renders styled text to the terminal and responds to keyboard, mouse, paste, resize, and time events. `Tui.programOrScript` lets the same script behave interactively in a TTY and as a plain `BackendTask` under CI or when its output is piped.
+- **[`Test.PagesProgram`](https://package.elm-lang.org/packages/dillonkearns/elm-pages/12.3.0/Test-PagesProgram/)** — end-to-end tests for elm-pages routes. Drive the real framework runtime through form submissions, optimistic UI, concurrent fetchers, redirects, session cookies, and error pages with simulated HTTP and custom ports. Deterministic, in-process, no browser. Inspired by [elm-program-test](https://package.elm-lang.org/packages/avh4/elm-program-test/latest/).
+- **[`Test.Tui`](https://package.elm-lang.org/packages/dillonkearns/elm-pages/12.3.0/Test-Tui/)** — pure Elm tests for TUI programs. Simulate keypresses and mouse events, resolve pending `BackendTask`s with the [`Test.BackendTask`](https://package.elm-lang.org/packages/dillonkearns/elm-pages/12.3.0/Test-BackendTask/) simulators, and assert on screen output.
+- **Visual test runner** — `elm-pages dev` serves page tests in the browser at `/_tests`, and `elm-pages test --visual` steps through TUI tests in the terminal. Run tests headlessly with `elm-pages test`.
+
+See [`examples/smoothies/tests/`](https://github.com/dillonkearns/elm-pages/tree/master/examples/smoothies/tests) and [`examples/todos/tests/`](https://github.com/dillonkearns/elm-pages/tree/master/examples/todos/tests) for route tests, and [`examples/end-to-end/script/tests/TuiStarsTests.elm`](https://github.com/dillonkearns/elm-pages/blob/master/examples/end-to-end/script/tests/TuiStarsTests.elm) for a TUI test.
 
 ## Getting Started Resources
 
+- [elm-pages Docs Site](https://elm-pages.com/docs)
+- [elm-pages site showcase](https://elm-pages.com/showcase/)
+- [elm-pages Elm API Docs](https://package.elm-lang.org/packages/dillonkearns/elm-pages/12.3.0/)
 - [Quick start repo](https://github.com/dillonkearns/elm-pages-starter) [(live site hosted here)](https://elm-pages-starter.netlify.com)
 - [Introducing `elm-pages` blog post](https://elm-pages.com/blog/introducing-elm-pages)
-- [Quick Start page in docs site](https://elm-pages.com/docs)
-- [`examples` folder](https://github.com/dillonkearns/elm-pages/blob/master/examples/) (includes https://elm-pages.com site source)
+- [`examples` folder](https://github.com/dillonkearns/elm-pages/blob/master/examples/) (includes https://elm-pages.com site source) Use `git clone --recurse-submodules https://github.com/dillonkearns/elm-pages.git` so that there aren't missing files when you try to build the examples.
 
-## Key features
+## Compatibility Key
 
-### SEO made easy
+You will see an error if the NPM and Elm package do not have a matching Compatibility Key. Usually it's best to upgrade to the latest version of both the Elm and NPM
+packages when you upgrade. However, in case you want to install versions that are behind the latest, the Compatibility Key is included here for reference.
 
-With `elm-pages`, SEO is as easy
-as calling a type-safe, high-level Elm API
-and passing in data from your content's metadata.
+Current Compatibility Key: 29.
 
-The metadata is just Elm data that you define
-however you want, using a Json Decoder to grab
-data out of your markdown frontmatter.
+## Why is `elm/virtual-dom` held at 1.0.5?
 
-```elm
-import MyMetadata exposing (MyMetadata)
+`elm-pages` compiles your app with [Lamdera](https://lamdera.com), and Lamdera 1.5.0 swaps in its own copy of `elm/virtual-dom`, based on [elm-safe-virtual-dom](https://github.com/lydell/elm-safe-virtual-dom). That copy is what keeps your app working when a browser extension changes the page, and it is how frozen views are drawn from the server's HTML.
 
-head : BlogMetadata -> List (Head.Tag Pages.PathKey)
-head meta =
-  Seo.summaryLarge
-    { canonicalUrlOverride = Nothing
-    , siteName = "elm-pages"
-    , image =
-      { url = PagesNew.images.icon
-      , alt = meta.description
-      , dimensions = Nothing
-      , mimeType = Nothing
-      }
-    , description = meta.description
-    , locale = Nothing
-    , title = meta.title
-    }
-    |> Seo.article
-      { tags = []
-      , section = Nothing
-      , publishedTime = Just (Date.toIsoString meta.published)
-      , modifiedTime = Nothing
-      , expirationTime = Nothing
-      }
+Each Lamdera release only accepts the `elm/virtual-dom` versions it knows about. Lamdera 1.5.0 accepts up to 1.0.5, and stops with an error if your `elm.json` asks for a newer one:
+
+```
+"elm/virtual-dom": "1.0.0 <= v <= 1.0.5"
+
+But your elm.json contains:
+
+    "elm/virtual-dom": "1.0.6"
+
+You need to update the Lamdera compiler.
 ```
 
-### Optimized for performance
-
-`elm-pages` has a set of features built-in to make
-sure your page is blazing fast on any device.
-
-- Automatic page pre-rendering
-- Page content is split up per-page so page content downloads and parses just-in-time
-- Page pre-fetching on link hover
-
-Try out `elm-pages`, open up Lighthouse, and
-see for yourself! Or check out https://elm-pages.com
-(find the source code in the [`examples/docs/`](https://github.com/dillonkearns/elm-pages/tree/master/examples/docs) folder).
-
-## Built-in type-safety
-
-`elm-pages` generates static Elm data for you
-to make sure you don't have any broken links or images.
-The SEO API even uses it to make sure you are only pointing to
-valid images and pages so you have valid metadata!
-
-For example, if you have a content folder like this:
-
-```shell
-- content
-  - blog
-    - index.md
-    - hello-world.md
-    - second-post.md
-```
-
-Then you will be able to access those pages in a
-type-safe way like this from Elm:
-
-```elm
--- this is a generated module
--- it is re-run whenever your `content` folder changes
--- just run `elm-pages develop` to start the watcher
-import Pages exposing (pages)
-import Pages.PagePath as PagePath exposing (PagePath)
-
-
-indexPage : PagePath Pages.PathKey
-indexPage =
-  pages.blog.index
-
-
-helloPostPage : PagePath Pages.PathKey
-helloPostPage =
-  pages.blog.helloWorld
-
-
-secondPost : PagePath Pages.PathKey
-secondPost =
-  pages.blog.secondPost
-```
-
-## Offline Support
-
-`elm-pages` uses pure elm configuration to setup
-your progressive web app settings. This includes
-a "source icon" which is used to generate your favicons
-and icons for the images following best practices for
-a progressive web app. The image is even a type-safe
-`ImagePath` that guarantees you are using an available
-image!
-
-```elm
-manifest : Manifest.Config Pages.PathKey
-manifest =
-    { backgroundColor = Just Color.white
-    , categories = [ Pages.Manifest.Category.education ]
-    , displayMode = Manifest.Standalone
-    , orientation = Manifest.Portrait
-    , description = "elm-pages - A statically typed site generator."
-    , iarcRatingId = Nothing
-    , name = "elm-pages docs"
-    , themeColor = Just Color.white
-    , startUrl = pages.index
-    , shortName = Just "elm-pages"
-    , sourceIcon = images.icon
-    }
-```
-
-It will also take care of setting up a service worker
-which will automatically cache the basic shell
-for your application's compiled Elm code and
-HTML container. The page content is currently cached
-as it is loaded, but in the future there will
-be an API to choose some pages to "warm up" in the cache.
-
-## What's next?
-
-Take a look at the current projects to see the current priorities!
-
-https://github.com/dillonkearns/elm-pages/projects
-
-## Contributors ✨
-
-Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
-
-<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
-<!-- prettier-ignore-start -->
-<!-- markdownlint-disable -->
-<table>
-  <tr>
-    <td align="center"><a href="https://github.com/danmarcab"><img src="https://avatars2.githubusercontent.com/u/1517969?v=4" width="100px;" alt=""/><br /><sub><b>Daniel Marín</b></sub></a><br /><a href="https://github.com/dillonkearns/elm-pages/commits?author=danmarcab" title="Code">💻</a></td>
-    <td align="center"><a href="https://citric.id"><img src="https://avatars1.githubusercontent.com/u/296665?v=4" width="100px;" alt=""/><br /><sub><b>Steven Vandevelde</b></sub></a><br /><a href="https://github.com/dillonkearns/elm-pages/commits?author=icidasset" title="Code">💻</a></td>
-    <td align="center"><a href="https://github.com/Y0hy0h"><img src="https://avatars0.githubusercontent.com/u/11377826?v=4" width="100px;" alt=""/><br /><sub><b>Johannes Maas</b></sub></a><br /><a href="#userTesting-Y0hy0h" title="User Testing">📓</a></td>
-    <td align="center"><a href="https://github.com/vViktorPL"><img src="https://avatars1.githubusercontent.com/u/2961541?v=4" width="100px;" alt=""/><br /><sub><b>Wiktor Toporek</b></sub></a><br /><a href="https://github.com/dillonkearns/elm-pages/commits?author=vViktorPL" title="Code">💻</a></td>
-    <td align="center"><a href="https://sunrisemovement.com"><img src="https://avatars1.githubusercontent.com/u/1508245?v=4" width="100px;" alt=""/><br /><sub><b>Luke Westby</b></sub></a><br /><a href="https://github.com/dillonkearns/elm-pages/commits?author=lukewestby" title="Code">💻</a></td>
-  </tr>
-</table>
-
-<!-- markdownlint-enable -->
-<!-- prettier-ignore-end -->
-<!-- ALL-CONTRIBUTORS-LIST:END -->
-
-This project follows the [all-contributors](https://github.com/all-contributors/all-contributors) specification. Contributions of any kind welcome!
+So the `elm-pages` Elm package asks for exactly `elm/virtual-dom` 1.0.5. If you see the error above, or a dependency conflict about `elm/virtual-dom` when you install `elm-pages`, set `elm/virtual-dom` to `1.0.5` in your `elm.json`. Nothing is lost by this: Lamdera uses its own copy either way. The limit will go up when a Lamdera release accepts a newer version.

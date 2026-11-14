@@ -9,21 +9,450 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** Node.js 22 or later is now required: 22.22.2 or later
+  on the 22 line, 24.15.0 or later on the 24 line, or 26 and up. Node 20
+  reached its end of life in April 2026, and several dependencies
+  (`chokidar` 6, `commander` 15, `which` 7, `make-fetch-happen` 16) no
+  longer support it. `npm install` warns if your Node version is
+  outside that range.
+- **Breaking:** Lamdera 1.5.0 or later is now required. `elm-pages`
+  checks the version of `lamdera` on your PATH and tells you how to
+  update if it is too old (`npm install --save-dev lamdera@latest`).
+  Projects that need to stay on an older Lamdera can stay on an older
+  `elm-pages`.
+- Hot reloading in `elm-pages dev` now uses the hot reloading that
+  Lamdera 1.5.0 builds into compiled code, instead of `elm-hot`. The
+  running app keeps its model and ports when new code arrives. If the
+  new code cannot be swapped in (for example the model changed shape),
+  the page reloads instead. The `elm-hot` dependency is gone.
+- The frozen view patch for the older virtual DOM is removed, along with
+  the detection that chose between the two. If the compiled code is not
+  what elm-pages expects, the build now stops instead of shipping pages
+  whose frozen views would not show.
+- Pre-rendered HTML now has a `data-elm` attribute on each element.
+  This comes from the safe virtual DOM that Lamdera 1.5.0 uses, which
+  needs it to pick up server-rendered elements in the browser. The
+  attribute is removed again on the first render.
+- `elm-pages init` template now installs Lamdera 1.5.0.
+- **Breaking:** elm-review 2.13.3 or later is now required, and checked
+  at startup. With older versions, elm-review found nothing when its
+  rules were built with Lamdera, so builds skipped frozen views and dead
+  code elimination without any warning.
+- A build now stops with an explanation when elm-review could not review
+  the project (for example two modules with the same name), or reported
+  nothing at all. Before, the build carried on without the frozen view
+  and dead code transforms.
+
+### Fixed
+
+- `elm-pages dev` failed to serve the app with Lamdera 1.5.0
+  (`[elm-hot] Browser.Navigation.Key def not found`).
+- The dev server no longer crashes when preparing the client code fails
+  with an unexpected error. The error is shown in the browser overlay.
+- `View.freeze` in a project whose `View` is not plain `elm/html` (for
+  example elm-css) no longer fails to compile in a production build. The
+  client transform now keeps your `View.freeze` call and only replaces
+  its argument.
+- Frozen views (`View.freeze`) disappeared from the page when the app
+  started, and after client-side navigation, with the safe virtual DOM
+  that Lamdera 1.5.0 uses. They are now drawn from the server-rendered
+  HTML in both cases.
+
+## [3.5.1] - 2026-05-11
+
+### Changed
+
+- `elm-pages init` template refreshed to current published Elm package
+  versions: `dillonkearns/elm-pages` 12.3.0 and `dillonkearns/elm-form`
+  3.1.0 in `codegen/elm.codegen.json` (the main `elm.json` was already
+  bumped in 12.3.0), and `mdgriffith/elm-codegen` 6.0.3 in `elm.json` /
+  `script/elm.json`.
+- Generated `TestApp` module now exposes a `Step` type alias so test
+  helpers can carry meaningful signatures (e.g.
+  `toggleTodo : String -> TestApp.Step`).
+
+## [3.5.0] - 2026-04-28
+
+### Added
+
+- `elm-pages test` command — auto-discovers and runs every test in your
+  project through `elm-test`: `ProgramTest` values (for elm-pages
+  routes), `TuiTest.Test` values (for `Tui` programs), and vanilla
+  `Test` values from
+  [elm-explorations/test](https://package.elm-lang.org/packages/elm-explorations/test/latest/).
+  Replaces the need to run `elm-test` separately. Pass `--visual` to
+  step through named TUI tests in an interactive terminal stepper.
+- Browser-based visual test viewer at `/_tests` on the `elm-pages dev`
+  server. Steps through route tests as a timeline with per-step
+  rendered views, network log, and fetcher inspector.
+
+## [3.3.4] - 2026-04-01
+
+### Added
+
+- `--coverage` flag for `elm-pages run`. Generates lcov.info coverage reports using elm-instrument.
+
+### Fixed
+
+- Fix browser URL not updating after a form submission that returns a redirect.
+
+## [3.3.3] - 2026-03-30
+
+### Fixed
+
+- Reject `elm-pages-internal://` URLs in `BackendTask.Http` requests. Internal requests now use a separate code path.
+
+## [3.3.1] - 2026-03-30
+
+### Fixed
+
+- Fix `elm-pages init` producing projects with incompatible Elm dependencies. The init template referenced elm-pages 12.0.2 with elm-cli-options-parser 5.0.1, but 12.0.2 requires elm-cli-options-parser 4.x. The template now correctly references elm-pages 12.1.0 with fully resolved dependencies.
+- Update init template to use direct npm devDependencies for `elm` and `elm-format` instead of `elm-tooling`, removing the `postinstall` script.
+- Upgrade all Elm and npm dependencies in the init template to their latest compatible versions.
+
+## [3.3.0] - 2026-03-14
+
+### Added
+
+- `elm-pages introspect` command — batch-discovers all scripts defined with `Script.withSchema` and prints a JSON array of their metadata (name, description, help, inputSchema, outputSchema, path). Designed as a lightweight alternative to MCP for tool/agent discovery. See [#583](https://github.com/dillonkearns/elm-pages/pull/583).
+- `--introspect-cli` flag for `elm-pages run` — prints a single script's metadata JSON and exits without running it. Works with scripts defined using `Script.withSchema`.
+- JSON input mode for `elm-pages run` — pass a JSON object as a single argument to invoke a script without CLI flags (e.g. `elm-pages run MyScript.elm '{"key":"value","$cli":{}}'`).
+- Runtime support for `Script.withSchema` — the JS runtime now handles typed output encoding and introspection metadata extraction.
+- `Test.BackendTask` test runner support — the JS runtime now supports the testable `BackendTask` simulation layer for `elm-test`. See [#582](https://github.com/dillonkearns/elm-pages/pull/582).
+
+## [3.2.0] - 2026-03-04
+
+### Added
+
+- Local DB for `elm-pages` Scripts — a type-safe, file-based database with automatic migrations (see [#576](https://github.com/dillonkearns/elm-pages/pull/576)):
+  - `elm-pages db init` — scaffolds `Db.elm` and `db/Db/Migrate/V1.elm`, adds artifacts to `.gitignore`.
+  - `elm-pages db status` — shows schema version, db.bin compatibility, and migration chain status. Exits with code 1 when migrations are pending.
+  - `elm-pages db migrate` — creates migration scaffolds (snapshot + stub) or applies pending migrations. Supports `--force-stale-snapshot` for edge cases.
+  - Generated `Pages.Db` reads schema metadata (`version` + `hash`) and applies migration chains at script runtime.
+  - Fresh installs seed from `Db.Migrate.V1.seed` through the migration `seed` chain.
+  - Connection-based path configuration through `Pages.Db.open`/`Pages.Db.default`, with runtime path support in request payloads.
+  - `Script.withDatabasePath` support in the JS runtime now applies to `Pages.Db.default`.
+  - Stale snapshot auto-recovery from `db/schema-history/<hash>.elm` when `Db.elm` changed before the old schema was captured.
+  - Schema version derived from `db/Db/Migrate/V*.elm` files — no separate version tracking file needed.
+- New docs page for script DB usage and migration behavior: `examples/docs/content/docs/17-elm-pages-scripts-db.md`.
+- `--optimize` flag for `elm-pages bundle-script`, with levels `0` (no optimization), `1` (Elm compiler optimizations), or `2` (elm-optimize-level-2, the default).
+
+### Changed
+
+- **Breaking:** Scripts now require the `lamdera` compiler. The `elm` binary is no longer supported as a fallback.
+- **Breaking:** JS↔Elm ports now pass `Bytes` directly instead of Base64-encoded strings. This removes the `base64` dependency and reduces client bundle size. If you have custom port code that was consuming Base64-encoded data from elm-pages, you will need to update it to handle raw byte arrays instead.
+- Updated devcert dependency (see [#572](https://github.com/dillonkearns/elm-pages/pull/572)). Thank you [@miniBill](https://github.com/miniBill)!
+- More precise TypeScript types for internal JS code (see [#564](https://github.com/dillonkearns/elm-pages/pull/564)). Thank you [@miniBill](https://github.com/miniBill)!
+
+### Fixed
+
+- Fix spinner output printing on non-interactive terminals (e.g. CI). Spinner state changes are now suppressed when not running in a TTY (see [#568](https://github.com/dillonkearns/elm-pages/pull/568)).
+- Fix config not loading on Windows (see [#483](https://github.com/dillonkearns/elm-pages/pull/483)). Thank you [@bdukes](https://github.com/bdukes)!
+- Fall back to `node_modules/.bin/elm-format` when `elm-format` is not on PATH, and pass `--elm-format-path` to elm-review to fix Netlify builds. Surface a clear error message when the elm-format dependency is missing instead of silently failing.
+- Fix issue where clicking to a heading in docs pages would cover the heading text.
+
+## [3.1.5] - 2026-02-23
+
+### Fixed
+
+- Fix build failures caused by stale codemod-transformed files not being overwritten on subsequent builds. `copyDirIfNewer` skipped re-copying app files because the codemod had modified them (making their mtime newer than the source), so elm-review analysis ran on already-transformed code and found no ephemeral fields.
+- Fix server-side elm-review codemod failing to create Ephemeral types on clean builds (e.g. Netlify CI) by pre-generating Route.elm, Pages.elm, and Fetcher modules in the server folder before the codemod runs.
+
+## [3.1.4] - 2026-02-23
+
+### Fixed
+
+- Fix false "ephemeral disagreement" errors caused by elm-review stderr output being mixed into JSON stdout. Fixes incorrect error reporting during frozen view codegen.
+- Fix overlapping elm-review fix ranges in ephemeral type generation by combining all fixes into a single `errorWithFix`.
+- Show a helpful error message when neither `lamdera` nor `elm` is found on PATH, instead of silently failing. Fixes [#562](https://github.com/dillonkearns/elm-pages/issues/562).
+
+### Changed
+
+- Improved performance of the `NoInvalidFreeze` elm-review rule (see [#566](https://github.com/dillonkearns/elm-pages/pull/566)). Thank you [@jfmengels](https://github.com/jfmengels)!
+
+## [3.1.3] - 2026-02-16
+
+### Fixed
+
+- Add missing files to `package.json` for NPM packaging.
+
+## [3.1.2] - 2026-02-16
+
+### Fixed
+
+- Handle more pipeline variations (`|>`, `<|`) in `View.freeze` optimizations.
+- Fix taint analysis for `Shared` to track model correctly, and fix codemod to always use `elm/html` map (never `Html.Styled`).
+- Error handling for cases where no `source-directories` are found, to avoid confusing stack trace.
+
+### Added
+
+- Show help text for `elm-pages run --help` or `-h`.
+
+## [3.1.0] - 2026-02-15
+
+### Added
+
+- **Frozen Views** support: virtual-dom codemod, frozen view extraction, combined `content.dat` format, and client-side frozen view management for SPA navigations.
+- `--strict` and `--keep-cache` build flags. `--strict` fails the build if any `View.freeze` calls are de-optimized. `--keep-cache` preserves the HTTP and JS Port cache between builds.
+- CLI lazy loading for faster startup.
+- Support for `BackendTask.Http.multipartBody` from the Elm package. Multipart bodies are encoded using the built-in `FormData` API and streamed via Node's native `fetch`. See [#558](https://github.com/dillonkearns/elm-pages/pull/558).
+
+### Fixed
+
+- XSS fix for raw text closing tags in server-rendered HTML.
+
+## [3.0.28] - 2026-01-31
+
+### Added
+
+- Support for `Script.readKey` and `Script.readKeyWithDefault` from the Elm package.
+
+## [3.0.27] - 2026-01-07
+
+### Fixed
+
+- Extend dead code elimination codemod to also stub out the `pages` function in preRender routes. This allows Elm's dead code elimination to remove server-only code referenced by `pages`, reducing client-side bundle size (see [#544](https://github.com/dillonkearns/elm-pages/pull/544)).
+- [Updated NPM dependencies](https://github.com/dillonkearns/elm-pages/pull/545).
+
+## [3.0.26] - 2025-12-07
+
+### Fixed
+
+- Fix spawnElmMake race condition where the subprocess could finish before event listeners were attached. See [#543](https://github.com/dillonkearns/elm-pages/pull/543).
+
+## [3.0.25] - 2025-09-09
+
+### Fixed
+
+- Fix redundant asset fetched with script tag attributes. See [#536](https://github.com/dillonkearns/elm-pages/issues/536).
+
+## [3.0.24] - 2025-04-30
+
+### Fixed
+
+- Fix missing versionString flag error which caused error in elm-pages run command. Fixes [#527](https://github.com/dillonkearns/elm-pages/issues/527).
+
+## [3.0.23] - 2025-04-13
+
+### Added
+
+- Added a `--set-version` flag to the `bundle-script` command to allow setting a custom version string for bundled scripts.
+
+## [3.0.22] - 2025-03-05
+
+### Fixed
+
+- Update Elm package version in starter template.
+
+## [3.0.21] - 2025-03-05
+
+### Fixed
+
+- Updated dependencies, including elm-review version used for internal rule to allow users to upgrade to latest elm-review NPM package (be sure to update to the latest elm-review in your package.json as well, currently 2.13.2)
+- Updated elm-pages init template.
+
+## [3.0.20] - 2024-12-27
+
+### Fixed
+
+- Move `vite` to NPM dependency (instead of `devDependency`) to fix errors when running as standalone tool outside of a vite project folder
+- Update `elm-pages init` contents
+
+## [3.0.19] - 2024-12-04
+
+### Fixed
+
+- Fix an error in generated code with invalid imports related to an internal elm-codegen upgrade in the generator code (see [#503](https://github.com/dillonkearns/elm-pages/pull/503)).
+
+## [3.0.18] - 2024-12-03
+
+### Fixed
+
+- Fix an error in generated code with invalid imports related to an internal elm-codegen upgrade in the generator code (see [#502](https://github.com/dillonkearns/elm-pages/pull/502)).
+
+## [3.0.17] - 2024-11-26
+
+### Fixed
+
+- Upgrade to latest version of Vite, as well as other dependencies (see [#498](https://github.com/dillonkearns/elm-pages/pull/498)).
+
+## [3.0.16] - 2024-07-10
+
+### Fixed
+
+- Update elm-review dependencies so projects can use latest elm-review NPM package.
+
+## [3.0.15] - 2024-05-02
+
+### Fixed
+
+- Fix issue where command output did not pipe through correctly in the middle of a `Stream`.
+
+## [3.0.14] - 2024-04-29
+
+### Fixed
+
+- Removed invalid internal imports from generated `Main.elm` file.
+- Updated NPM dependencies.
+
+## [3.0.13] - 2024-04-28
+
+### Added
+
+- Added `SKIP_ELM_CODEGEN=true` option to skip `elm-codegen install` on `elm-pages run` (scripts) to allowing speeding up script execution by a few seconds.
+- Other support for `10.1.0` release of the `elm-pages` Elm package (see `CHANGELOG-ELM.md`).
+
+## [3.0.12] - 2024-01-10
+
+### Fixed
+
+- Fix issue with generated `Main.elm` code by using a different version of elm-codegen internally (does not effect the user-facing elm-codegen version constraints).
+
+## [3.0.11] - 2024-01-10
+
+### Fixed
+
+- Fix dependency versions in elm.json for starter template.
+
+## [3.0.10] - 2024-01-10
+
+### Fixed
+
+- Update elm-review version for an internally used rule to the latest Elm package to support newer elm-review NPM executable (fixes [#364](https://github.com/dillonkearns/elm-pages/issues/364)).
+- Allow reading files with absolute paths (still reads relative path by default), see [#390](https://github.com/dillonkearns/elm-pages/issues/390).
+- Fix an error with scripts (`elm-pages run`) when run on Windows, see [#446](https://github.com/dillonkearns/elm-pages/issues/446).
+- Remove `import FatalError` code changes in user-maintained files, see [#441](https://github.com/dillonkearns/elm-pages/issues/441).
+- Update dependencies in starter template.
+
+### Added
+
+- Add `AddStaticRoute` in starter template
+
+### Changed
+
+- Update to Vite v5. [NodeJS version 18 or 20+ is now required](https://vitejs.dev/guide/migration#node-js-support).
+- Update NPM dependencies to latest versions.
+
+## [3.0.9] - 2023-10-24
+
+### Fixed
+
+- Fix "SubmitEvent" error in older browsers, see [#427](https://github.com/dillonkearns/elm-pages/issues/427).
+
+## [3.0.8] - 2023-09-07
+
+### Fixed
+
+- Fix for a Windows path import issue, see [#384](https://github.com/dillonkearns/elm-pages/issues/384).
+- Removed some optional chaining operators to prevent unnecessary Node version requirement.
+
+## [2.1.9] - 2021-08-27
+
+### Added
+
+- Runs a special `elm-review` config to give better actionable errors for the user instead of error messages pointing to generated code. Note: this now requires `elm-review` to be on the PATH when running `elm-pages`.
+
+## [2.1.8] - 2021-08-25
+
+### Fixed
+
+- `</script>` tags within DataSource's are now escaped correctly on the pre-rendered HTML. Thank you [@danmarcab](https://github.com/danmarcab) for the report and the fix! See [#207](https://github.com/dillonkearns/elm-pages/pull/207).
+
+## [2.1.7] - 2021-08-17
+
+### Fixed
+
+- Check for `elm` and `elm-optimize-level-2` executables before running build step to report better error message.
+- Removed `elm-optimize-level-2` as a dependency since the user needs to install it as a `devDependency` in their project anyway to make the binary available.
+
+## [2.1.6] - 2021-08-15
+
+### Fixed
+
+- `undefined` errors that were printed in `elm-pages build` are now showing the correct error output.
+
+## [2.1.4] - 2021-08-02
+
+### Fixed
+
+- Refer to latest NPM version in init template.
+
+## [2.1.3] - 2021-08-02
+
+### Fixed
+
+- Cleaned up error printing in dev server and build to prevent some errors when presenting failure messages.
+
+## [1.5.5] - 2020-02-16
+
+### Fixed
+
+- Use `cross-spawn` in the beta build to support running on Windows. Thank you @j-maas for fix [#161](https://github.com/dillonkearns/elm-pages/pull/161)!
+
+## [1.5.4] - 2020-11-02
+
+### Fixed
+
+- Use a more reliable codegeneration order for the elm-pages dev server to make sure changes hot reload correctly.
+
+## [1.5.3] - 2020-10-29
+
+### Fixed
+
+- 1.5.2 didn't end up fixing the infinite loop in `elm-pages develop`. It's now properly fixed.
+- No more double-builds on changes for `elm-pages develop` webpack dev server, so page changes are faster.
+
+## [1.5.2] - 2020-10-28
+
+### Fixed
+
+- Fixed infinite loop in `elm-pages develop` from the new generated beta code.
+
+## [1.5.1] - 2020-10-27
+
+### Fixed
+
+- Add missing closing tag for `<head>` in beta build command output.
+- Make sure to add `/` separator for `content.json` file requests in beta build's JS code.
+
+## [1.5.0] - 2020-10-26
+
+### Added
+
+- Support for `elm-pages-beta` no-webpack build command (see Elm package [release notes for 7.0.0](https://github.com/dillonkearns/elm-pages/blob/master/CHANGELOG-ELM.md#700---2020-10-26)).
+
+## [1.4.3] - 2020-08-17
+
+### Added
+
+- `elm-pages build --skip-dist` option allows you to build the generated Elm code and
+  check for errors without running the pre-rendering steps. Thank you [@sparksp](https://github.com/sparksp)!
+  See https://github.com/dillonkearns/elm-pages/pull/123/files.
+
+### Fixed
+
+- Added headers to the dev server that prevent Safari from serving up stale data. Thank you
+  Kevin Yank for reporting the issue!
+
 ## [1.4.2] - 2020-07-14
 
 ### Added
+
 - Added dimensions to static images: https://github.com/dillonkearns/elm-pages/pull/110.
 
 ## [1.4.1] - 2020-06-16
 
 ### Fixed
 
-- Fix `static` folder behavior in Windows, see [#118](https://github.com/dillonkearns/elm-pages/pull/118) (thank you [Y0hy0h](https://github.com/Y0hy0h)!).
+- Fix `static` folder behavior in Windows, see [#118](https://github.com/dillonkearns/elm-pages/pull/118) (thank you [j-maas](https://github.com/j-maas)!).
 - Make sure that process exits with non-zero status on error so build fails when there are errors in the build. See [#121](https://github.com/dillonkearns/elm-pages/pull/121).
 
 ## [1.4.0] - 2020-05-11
 
 ### Added
+
 - Added hot content reloading to the dev server! That means that you no longer have to restart your dev server if you add/change a StaticHttp request. You don't even
   have to reload your browser! It will automatically load in the new data, while keeping your application state. Your markdown (or other format) data, and metadata,
   from the `content` folder will also load for you without having to restart the dev server or refresh your browser! You'll see a loading indicator to show you when
@@ -35,11 +464,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   there's still an issue where if you no longer generate a file, you'll need to restart your dev server to get a 404 when hitting that URL.
 
 ### Changed
+
 - Uses Terser instead of GoogleClosureCompiler to minify the JavaScript bundle in production. GoogleClosureCompiler was causing some issues for Windows users when
   they ran `elm-pages build` because that dependency has known issues on Windows. See [#90](https://github.com/dillonkearns/elm-pages/pull/90). Thank you very much
-  to [Johannes Maas](https://github.com/Y0hy0h) for the PR!
+  to [Johannes Maas](https://github.com/j-maas) for the PR!
 
 ### Fixed
+
 - Fixed an issue with the dev server not noticing changes to `.emu` files. See [#78](https://github.com/dillonkearns/elm-pages/issues/78). `elm-markup` files, and files with
   the `.emu` extension, are handled exactly like any other files in the `content/` folder now. This simplifies the API, and the internal logic is simpler and less error-prone.
 - Decode errors now show error messages correctly for `StaticHttp.unoptimizedRequest`s.
@@ -51,6 +482,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [1.3.0] - 2020-03-28
 
 ### Added
+
 - You can now host your `elm-pages` site in a sub-directory. For example, you could host it at mysite.com/blog, where the top-level mysite.com/ is hosting a different app.
   This works using [HTML `<base>` tags](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base). The paths you get from `PagePath.toString` and `ImagePath.toString`
   will use relative paths (e.g. `blog/my-article`) instead of absolute URLs (e.g. `/blog/my-article`), so you can take advantage of this functionality by just making sure you

@@ -7,113 +7,174 @@ on:
   pull_request:
     branches:
       - master
+      - serverless-latest
+env:
+  SESSION_SECRET: hello
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v2
-      - name: Use Node.js 13
-        uses: actions/setup-node@v1
+      - uses: actions/checkout@v6
         with:
-          node-version: 13
-      - uses: actions/cache@v1
+          submodules: recursive
+      - uses: actions/setup-node@v6
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-      - uses: actions/cache@v1
-        id: elm-cache
+          node-version: 22
+      - name: Cache node_modules
+        id: cache-node_modules
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/Cypress
+            node_modules
+          key: node_modules-${{ hashFiles('package-lock.json') }}
+      - name: Cache ~/.elm
+        uses: actions/cache@v5
         with:
           path: ~/.elm
-          key: ${{ runner.os }}-elm-home-${{ hashFiles('**/elm.json') }}
-      - run: npm ci
-      - run: ./node_modules/.bin/elm make --output /dev/null && cd generator && ../node_modules/.bin/elm make --output /dev/null src/Main.elm
-      - run: npm test
-
-  lint:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v2
-      - name: Use Node.js 13
-        uses: actions/setup-node@v1
-        with:
-          node-version: 13
-      - uses: actions/cache@v1
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-      - uses: actions/cache@v1
-        id: elm-cache
-        with:
-          path: ~/.elm
-          key: ${{ runner.os }}-elm-home-${{ hashFiles('**/elm.json') }}
-      - run: npm ci
-      - run: ./node_modules/.bin/elm make --output /dev/null && cd generator && ../node_modules/.bin/elm make --output /dev/null src/Main.elm
-      - name: elm-format
-        run: npx --no-install elm-format --validate
-
-  validate-package:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v2
-      - name: Use Node.js 13
-        uses: actions/setup-node@v1
-        with:
-          node-version: 13
-      - uses: actions/cache@v1
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-      - uses: actions/cache@v1
-        id: elm-cache
-        with:
-          path: ~/.elm
-          key: ${{ runner.os }}-elm-home-${{ hashFiles('**/elm.json') }}
-      - run: npm ci
-      - run: ./node_modules/.bin/elm make --output /dev/null && cd generator && ../node_modules/.bin/elm make --output /dev/null src/Main.elm
+          key: elm-v3-${{ hashFiles('elm.json', 'elm-tooling.json', 'generator/elm.json', 'review/elm.json', 'examples/routing/elm.json', 'examples/escaping/elm.json', 'examples/base-path/elm.json') }}
+      - name: npm ci
+        if: steps.cache-node_modules.outputs.cache-hit != 'true'
+        env:
+          NO_ELM_TOOLING_INSTALL: 1
+        run: npm ci
+      - name: elm-tooling install
+        run: npx --no-install elm-tooling install
+      - name: Install elm-instrument (for coverage tests)
+        run: npm install -g elm-coverage
+      - name: Add node_modules/.bin to PATH
+        run: realpath node_modules/.bin >> $GITHUB_PATH
+      - uses: sparksp/elm-review-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build Generator
+        run: npm run build:generator
+      - name: Tests
+        run: npm test
       - name: Build elm docs
-        run: ./node_modules/.bin/elm make --docs docs.json
+        run: rm -rf elm-stuff && lamdera make --docs docs.json
+      - name: Build base path example site
+        run: cd examples/base-path && npm install && npx elm-pages build --base elm-pages && cd ../..
+      - name: GitHub Pages Example Deploy
+        uses: peaceiris/actions-gh-pages@v4
+        if: github.ref == 'refs/heads/master'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./examples/base-path/dist
+
+  cypress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Cache node_modules
+        id: cache-node_modules
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/Cypress
+            node_modules
+          key: node_modules-${{ hashFiles('package-lock.json') }}
+      - name: Cache ~/.elm
+        uses: actions/cache@v5
+        with:
+          path: ~/.elm
+          key: elm-v3-${{ hashFiles('elm.json', 'elm-tooling.json', 'generator/elm.json', 'review/elm.json', 'examples/routing/elm.json', 'examples/escaping/elm.json', 'examples/base-path/elm.json') }}
+      - name: npm ci
+        if: steps.cache-node_modules.outputs.cache-hit != 'true'
+        env:
+          NO_ELM_TOOLING_INSTALL: 1
+        run: npm ci
+      - name: elm-tooling install
+        run: npx --no-install elm-tooling install
+      - name: Add node_modules/.bin to PATH
+        run: realpath node_modules/.bin >> $GITHUB_PATH
+      - name: Build Generator
+        run: npm run build:generator
+      - name: Setup for cypress
+        run: (cd examples/end-to-end && rm -f formatted-elm.txt && npm install && npx elm-tooling install && rm -rf elm-stuff && npx elm-pages gen && lamdera make app/Route/Index.elm)
+      - name: DB migration E2E test
+        run: cd examples/end-to-end && node ../../generator/src/cli.js run TestMigration
+      - name: Cypress tests
+        uses: cypress-io/github-action@v7
+        with:
+          working-directory: examples/end-to-end
+          start: node ../../generator/src/cli.js dev --debug
+          wait-on: "http://localhost:1234"
+          wait-on-timeout: 120
+      # Stop it, so only one dev server at a time compiles into elm-stuff
+      - name: Stop the --debug dev server
+        run: pkill -f "cli.js dev --debug" || true
+      # Plain `elm-pages dev` compiles with --optimize. Some bugs only show up
+      # there, so a few tests run against it too (cypress/dev-default).
+      - name: Cypress tests (dev server without --debug)
+        uses: cypress-io/github-action@v7
+        with:
+          working-directory: examples/end-to-end
+          install: false
+          config-file: cypress.dev-default.config.js
+          start: node ../../generator/src/cli.js dev --port 1235
+          wait-on: "http://localhost:1235"
+          wait-on-timeout: 120
+      - name: Stop the dev server
+        run: pkill -f "cli.js dev --port 1235" || true
+      - name: Production build for frozen view tests
+        run: cd examples/end-to-end && node ../../generator/src/cli.js build --debug && node check-frozen-views.mjs
+      - name: Cypress tests (production build)
+        uses: cypress-io/github-action@v7
+        with:
+          working-directory: examples/end-to-end
+          install: false
+          config-file: cypress.production.config.js
+          start: node serve-dist.mjs
+          wait-on: "http://localhost:3457"
+          wait-on-timeout: 60
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: cypress-screenshots
+          path: examples/end-to-end/cypress/screenshots
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: cypress-videos
+          path: examples/end-to-end/cypress/videos
 
   publish:
-    needs: [test, lint, validate-package]
+    needs: [build, cypress]
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v2
-      - name: Use Node.js 13
-        uses: actions/setup-node@v1
+      - uses: actions/checkout@v6
         with:
-          node-version: 13
-      - uses: actions/cache@v1
+          submodules: recursive
+      - uses: actions/setup-node@v6
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-      - uses: actions/cache@v1
-        id: elm-cache
+          node-version: 22
+      - name: Cache node_modules
+        id: cache-node_modules
+        uses: actions/cache@v5
         with:
-          path: ~/.elm
-          key: ${{ runner.os }}-elm-home-${{ hashFiles('**/elm.json') }}
-      - run: npm ci
-      - run: ./node_modules/.bin/elm make --output /dev/null && cd generator && ../node_modules/.bin/elm make --output /dev/null src/Main.elm
+          path: node_modules
+          key: node_modules-${{ hashFiles('package-lock.json') }}
+      - name: npm ci
+        if: steps.cache-node_modules.outputs.cache-hit != 'true'
+        env:
+          NO_ELM_TOOLING_INSTALL: 1
+        run: npm ci
+      - name: elm-tooling install
+        run: npx --no-install elm-tooling install
       - name: Elm Publish
-        uses: dillonkearns/elm-publish-action@1.0.1
+        uses: dillonkearns/elm-publish-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path-to-elm: ./node_modules/.bin/elm
-      - run: npm run build
       - id: npm-publish
         if: github.ref == 'refs/heads/master'
-        uses: JS-DevTools/npm-publish@v1
+        uses: JS-DevTools/npm-publish@v3
         with:
           token: ${{ secrets.NPM_TOKEN }}

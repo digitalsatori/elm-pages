@@ -1,12 +1,23 @@
-module BuildError exposing (BuildError, errorToString, errorsToString)
+module BuildError exposing (BuildError, encode, errorsToString, internal)
 
+import Json.Encode as Encode
 import TerminalText as Terminal
 
 
 type alias BuildError =
     { title : String
+    , path : String
     , message : List Terminal.Text
     , fatal : Bool
+    }
+
+
+internal : String -> { title : String, path : String, message : List Terminal.Text, fatal : Bool }
+internal string =
+    { title = "Internal Error"
+    , path = ""
+    , message = [ Terminal.text string ]
+    , fatal = True
     }
 
 
@@ -27,6 +38,32 @@ errorToString error =
 banner : String -> List Terminal.Text
 banner title =
     [ Terminal.cyan <|
-        Terminal.text ("-- " ++ String.toUpper title ++ " ----------------------------------------------------- elm-pages")
+        ("-- " ++ String.toUpper title ++ " ----------------------------------------------------- elm-pages")
     , Terminal.text "\n\n"
     ]
+
+
+encode : List BuildError -> Encode.Value
+encode buildErrors =
+    Encode.object
+        [ ( "type", Encode.string "compile-errors" )
+        , ( "errors"
+          , Encode.list
+                (\buildError ->
+                    Encode.object
+                        [ ( "path", Encode.string buildError.path )
+                        , ( "name", Encode.string buildError.title )
+                        , ( "problems", Encode.list (messagesEncoder buildError.title) [ buildError.message ] )
+                        ]
+                )
+                buildErrors
+          )
+        ]
+
+
+messagesEncoder : String -> List Terminal.Text -> Encode.Value
+messagesEncoder title messages =
+    Encode.object
+        [ ( "title", Encode.string title )
+        , ( "message", Encode.list Terminal.encoder messages )
+        ]

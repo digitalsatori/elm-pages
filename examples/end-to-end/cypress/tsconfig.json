@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "strict": true,
+    "target": "es2015",
+    "lib": ["es2015", "dom"],
+    "types": ["cypress"],
+    "ignoreDeprecations": "6.0"
+  },
+  "include": ["**/*.ts"]
+}

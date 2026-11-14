@@ -1,0 +1,856 @@
+import * as fs from "./dir-helpers.js";
+import * as fsPromises from "fs/promises";
+import { runElmReview, elmOptimizeLevel2, resolveCompileMode, modeToOptions } from "./compile-elm.js";
+import { patchFrozenViews } from "./frozen-view-codemod.js";
+import { patchCompiledCliApp } from "./patch-compiled-cli-app.js";
+import { restoreColorSafe } from "./error-formatter.js";
+import { requireSupportedLamderaVersion } from "./lamdera-version.js";
+import { requireSupportedElmReviewVersion } from "./elm-review-version.js";
+import * as path from "path";
+import { spawn as spawnCallback } from "cross-spawn";
+import * as codegen from "./codegen.js";
+// Note: terser is lazy-loaded in runTerser() to improve startup time
+import * as os from "os";
+import { Worker, SHARE_ENV } from "worker_threads";
+import { ensureDirSync, writeFileIfChanged } from "./file-helpers.js";
+import { needsPortsRecompilation } from "./script-cache.js";
+import { generateClientFolder, generateServerFolder, compareEphemeralFields, formatDisagreementError } from "./codegen.js";
+import { default as which } from "which";
+
+// Cache for which() results to avoid repeated PATH lookups
+let whichCache = {};
+// Note: vite is lazy-loaded in run() to improve startup time for other commands
+import * as preRenderHtml from "./pre-render-html.js";
+import * as esbuild from "esbuild";
+import { createHash } from "crypto";
+import { merge_vite_configs } from "./vite-utils.js";
+import { resolveConfig } from "./config.js";
+import * as globby from "globby";
+import { fileURLToPath } from "url";
+import { copyFile } from "fs/promises";
+
+let pool = [];
+let pagesReady;
+let pagesErrored;
+let pages = new Promise((resolve, reject) => {
+  pagesReady = resolve;
+  pagesErrored = reject;
+});
+let pagesReadyCalled = false;
+let activeWorkers = 0;
+let buildError = false;
+
+const OUTPUT_FILE_NAME = "elm.js";
+
+process.on("unhandledRejection", (error) => {
+  console.log(error);
+  process.exitCode = 1;
+});
+
+/**
+ * Parse elm-review validation output and filter to StaticRegionScope errors.
+ * @param {string} elmReviewOutput - JSON output from elm-review
+ * @returns {{errors: Array<{path: string, errors: Array}>}}
+ */
+function parseValidationOutput(elmReviewOutput) {
+  let jsonOutput;
+  try {
+    jsonOutput = JSON.parse(elmReviewOutput);
+  } catch (e) {
+    return { errors: [] };
+  }
+
+  if (!jsonOutput.errors) {
+    return { errors: [] };
+  }
+
+  // Filter to only NoInvalidFreeze errors
+  const filteredErrors = jsonOutput.errors
+    .map((fileErrors) => ({
+      path: fileErrors.path,
+      errors: fileErrors.errors.filter(
+        (error) => error.rule === "Pages.Review.NoInvalidFreeze"
+      ),
+    }))
+    .filter((fileErrors) => fileErrors.errors.length > 0);
+
+  return { errors: filteredErrors };
+}
+
+function ELM_FILE_PATH() {
+  return path.join(process.cwd(), "./elm-stuff/elm-pages", OUTPUT_FILE_NAME);
+}
+
+async function ensureRequiredDirs() {
+  ensureDirSync(`dist`);
+  ensureDirSync(path.join(process.cwd(), ".elm-pages", "http-response-cache"));
+}
+
+async function cachedWhich(executable) {
+  if (whichCache[executable] !== undefined) {
+    if (whichCache[executable] === false) {
+      throw new Error(`${executable} not found`);
+    }
+    return whichCache[executable];
+  }
+  try {
+    const result = await which(executable);
+    whichCache[executable] = result;
+    return result;
+  } catch (error) {
+    whichCache[executable] = false;
+    throw error;
+  }
+}
+
+async function ensureRequiredExecutables(options) {
+  const checks = await Promise.allSettled([
+    cachedWhich("lamdera"),
+    cachedWhich("elm-review"),
+  ]);
+
+  if (checks[0].status === "rejected") {
+    throw "I couldn't find lamdera on the PATH. Please ensure it's installed, either globally, or locally. If it's installed locally, ensure you're running through an NPM script or with npx so the PATH is configured to include it.";
+  }
+  requireSupportedLamderaVersion();
+  if (checks[1].status === "rejected") {
+    throw "I couldn't find elm-review on the PATH. Please ensure it's installed, either globally, or locally. If it's installed locally, ensure you're running through an NPM script or with npx so the PATH is configured to include it.";
+  }
+  requireSupportedElmReviewVersion();
+}
+
+export async function run(options) {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  console.warn = function (...messages) {
+    // This is a temporary hack to avoid this warning. elm-pages manages compiling the Elm code without Vite's involvement, so it is external to Vite.
+    // There is a pending issue to allow having external scripts in Vite, once this issue is fixed we can remove this hack:
+    // https://github.com/vitejs/vite/issues/3533
+    if (
+      messages &&
+      messages[0] &&
+      !messages[0].startsWith(`<script src="/elm.js">`)
+    ) {
+      console.info(...messages);
+    }
+  };
+  try {
+    // Run independent startup tasks in parallel
+    const [, , , config] = await Promise.all([
+      ensureRequiredDirs(),
+      ensureRequiredExecutables(options),
+      codegen.generate(options.base),
+      resolveConfig(),
+    ]);
+    await writeFileIfChanged(
+      "elm-stuff/elm-pages/index.html",
+      preRenderHtml.templateHtml(false, config.headTagsTemplate)
+    );
+    const viteConfig = merge_vite_configs(
+      {
+        configFile: false,
+        root: process.cwd(),
+        base: options.base,
+        assetsInclude: ["/elm-pages.js"],
+        ssr: false,
+
+        build: {
+          manifest: "___vite-manifest___.json",
+          outDir: "dist",
+          rollupOptions: {
+            input: "elm-stuff/elm-pages/index.html",
+          },
+        },
+        optimizeDeps: {
+          include: [],
+        },
+      },
+      config.vite || {}
+    );
+
+    const { build: viteBuild } = await import("vite");
+    const buildComplete = viteBuild(viteConfig);
+    const compileClientPromise = compileElm(options, config);
+    await buildComplete;
+    const clientResult = await compileClientPromise;
+
+    const deOptCount = clientResult.deOptimizationCount || 0;
+
+    // Always run validation on ORIGINAL source for scope and taint checks
+    const validationOutput = await runElmReview();
+    const validationResult = parseValidationOutput(validationOutput);
+
+    if (validationResult.errors.length > 0) {
+      const formatted = restoreColorSafe(validationOutput);
+
+      if (options.strict) {
+        console.error("\n" + formatted);
+        console.error("\nBuild failed: View.freeze validation errors detected.");
+        console.error("Use without --strict to continue with warnings.\n");
+        process.exitCode = 1;
+        return;
+      } else {
+        const warningFormatted = formatted.replace(/\x1b\[31m/g, '\x1b[33m').replace(/\x1b\[91m/g, '\x1b[93m');
+        console.warn("\n\x1b[33mView.freeze warnings:\x1b[0m\n");
+        console.warn(warningFormatted);
+      }
+    }
+
+    if (deOptCount > 0 && validationResult.errors.length > 0) {
+      console.warn(`\n\x1b[33m${deOptCount} View.freeze call(s) de-optimized (code still works, just without DCE).\x1b[0m\n`);
+    }
+
+    const fullOutputPath = path.join(process.cwd(), `./dist/elm.js`);
+    const withoutExtension = path.join(process.cwd(), `./dist/elm`);
+    const browserElmHash = await fingerprintElmAsset(
+      fullOutputPath,
+      withoutExtension
+    );
+    const assetManifestPath = path.join(
+      process.cwd(),
+      "dist/___vite-manifest___.json"
+    );
+    const manifest = JSON.parse(
+      await fsPromises.readFile(assetManifestPath, { encoding: "utf-8" })
+    );
+    const indexTemplate = await fsPromises.readFile(
+      "dist/elm-stuff/elm-pages/index.html",
+      "utf-8"
+    );
+    const preloadFiles = [
+      `elm.${browserElmHash}.js`,
+      ...Object.entries(manifest).map((entry) => entry[1].file),
+    ].map((file) => path.join(options.base, file));
+    const userProcessedPreloads = preloadFiles.flatMap((file) => {
+      const userPreloadForFile = config.preloadTagForFile(file);
+      if (userPreloadForFile === true) {
+        return [defaultPreloadForFile(file)];
+      } else if (userPreloadForFile === false) {
+        return [];
+      } else if (typeof userPreloadForFile === "string") {
+        return [userPreloadForFile];
+      } else {
+        throw `I expected preloadTagForFile in elm-pages.config.mjs to return a string or boolean, but instead it returned: ${userPreloadForFile}`;
+      }
+    });
+
+    const processedIndexTemplate = indexTemplate
+      .replace("<!-- PLACEHOLDER_PRELOADS -->", userProcessedPreloads.join(""))
+      .replace(
+        '<script defer src="/elm.js" type="text/javascript"></script>',
+        `<script defer src="/elm.${browserElmHash}.js" type="text/javascript"></script>`
+      );
+    await fsPromises.writeFile("dist/template.html", processedIndexTemplate);
+    // await fsPromises.unlink(assetManifestPath);
+
+    // Check if custom-backend-task needs recompilation
+    const portsCheck = await needsPortsRecompilation(process.cwd());
+    let portBackendTaskCompiled = Promise.resolve();
+
+    if (portsCheck.needed) {
+      portBackendTaskCompiled = esbuild
+        .build({
+          entryPoints: ["./custom-backend-task"],
+          platform: "node",
+          outfile: ".elm-pages/compiled-ports/custom-backend-task.mjs",
+          assetNames: "[name]-[hash]",
+          chunkNames: "chunks/[name]-[hash]",
+          outExtension: { ".js": ".js" },
+          metafile: true,
+          bundle: true,
+          format: "esm",
+          packages: "external",
+          logLevel: "silent",
+        })
+        .then((result) => {
+          try {
+            global.portsFilePath = Object.keys(result.metafile.outputs)[0];
+          } catch (e) {}
+        })
+        .catch((error) => {
+          const portBackendTaskFileFound =
+            globby.globbySync("./custom-backend-task.*").length > 0;
+          if (portBackendTaskFileFound) {
+            // don't present error if there are no files matching custom-backend-task
+            // if there are files matching custom-backend-task, warn the user in case something went wrong loading it
+            console.error("Failed to start custom-backend-task watcher", error);
+          }
+        });
+    } else if (portsCheck.outputPath) {
+      // Use cached output path
+      global.portsFilePath = portsCheck.outputPath;
+    }
+
+    global.XMLHttpRequest = {};
+    const compileCliPromise = compileCliApp(options);
+    try {
+      const serverResult = await compileCliPromise;
+      await portBackendTaskCompiled;
+
+      // Validate ephemeral field agreement between server and client transforms.
+      // Only check when the server codemod actually found ephemeral fields.
+      // If the server codemod failed silently (returned empty), skip the check
+      // and gracefully degrade (server sends all fields, client ignores extras).
+      if (serverResult.ephemeralFields && serverResult.ephemeralFields.size > 0 && clientResult.ephemeralFields) {
+        const disagreement = compareEphemeralFields(
+          serverResult.ephemeralFields,
+          clientResult.ephemeralFields
+        );
+        if (disagreement) {
+          throw new Error(formatDisagreementError(disagreement));
+        }
+      }
+      const inlineRenderCode = `
+import * as renderer from "./render.js";
+import * as elmModule from "${path.resolve("./elm-stuff/elm-pages/elm.cjs")}";
+import * as url from 'url';
+${
+  global.portsFilePath
+    ? `import * as customBackendTask from "${path.resolve(
+        global.portsFilePath
+      )}";`
+    : `const customBackendTask = {};`
+}
+
+import * as preRenderHtml from "./pre-render-html.js";
+import { extractAndReplaceFrozenViews } from "./extract-frozen-views.js";
+import { toExactBuffer } from "./binary-helpers.js";
+const basePath = \`${options.base || "/"}\`;
+const htmlTemplate = ${JSON.stringify(processedIndexTemplate)};
+const mode = "build";
+const addWatcher = () => {};
+
+export async function render(request) {
+  const requestTime = new Date();
+  const response = await renderer.render(
+    customBackendTask,
+    basePath,
+    elmModule.default,
+    mode,
+    (new url.URL(request.rawUrl)).pathname,
+    request,
+    addWatcher,
+    false
+  );
+  if (response.kind === "bytes") {
+    // Extract frozen views from HTML and prepend to content.dat
+    const { regions: frozenViews } = extractAndReplaceFrozenViews(response.html || "");
+    const frozenViewsJson = JSON.stringify(frozenViews);
+    const frozenViewsBuffer = Buffer.from(frozenViewsJson, 'utf8');
+    const lengthBuffer = Buffer.alloc(4);
+    lengthBuffer.writeUInt32BE(frozenViewsBuffer.length, 0);
+    const contentDatBuffer = Buffer.concat([
+      lengthBuffer,
+      frozenViewsBuffer,
+      toExactBuffer(response.contentDatPayload)
+    ]);
+    return {
+        body: contentDatBuffer,
+        statusCode: response.statusCode,
+        kind: response.kind,
+        headers: response.headers,
+    }
+  } else if (response.kind === "api-response") {
+    // isBase64Encoded
+    return {
+        body: response.body.body,
+        statusCode: response.body.statusCode,
+        kind: response.kind,
+        headers: response.body.headers,
+        isBase64Encoded: response.body.isBase64Encoded,
+    }
+  } else {
+    // Replace __STATIC__ placeholders with numeric IDs in the HTML
+    const { html: updatedHtml } = extractAndReplaceFrozenViews(response.htmlString?.html || "");
+    if (response.htmlString) {
+      response.htmlString.html = updatedHtml;
+    }
+
+    // Add empty frozen views prefix to bytesData (decoder expects this format)
+    if (response.contentDatPayload && response.htmlString) {
+      const emptyFrozenViewsJson = JSON.stringify({});
+      const emptyFrozenViewsBuffer = Buffer.from(emptyFrozenViewsJson, 'utf8');
+      const emptyLengthBuffer = Buffer.alloc(4);
+      emptyLengthBuffer.writeUInt32BE(emptyFrozenViewsBuffer.length, 0);
+      const htmlBytesBuffer = Buffer.concat([
+        emptyLengthBuffer,
+        emptyFrozenViewsBuffer,
+        toExactBuffer(response.contentDatPayload)
+      ]);
+      response.htmlString.bytesData = htmlBytesBuffer.toString("base64");
+    }
+
+    return {
+        body: preRenderHtml.replaceTemplate(htmlTemplate, response.htmlString),
+        statusCode: response.statusCode,
+        kind: response.kind,
+        headers: response.headers,
+    }
+  }
+}
+`;
+      await esbuild.build({
+        format: "esm",
+        platform: "node",
+        stdin: { contents: inlineRenderCode, resolveDir: __dirname },
+        bundle: true,
+        // TODO do I need to make the outfile joined with the current working directory?
+
+        outfile: ".elm-pages/compiled/render.mjs",
+        // external: ["node:*", ...options.external],
+        packages: "external",
+        minify: true,
+        // absWorkingDir: projectDirectory,
+        // banner: { js: `#!/usr/bin/env node\n\n${ESM_REQUIRE_SHIM}` },
+      });
+    } catch (cliError) {
+      // Check if this is an ephemeral field disagreement error - re-throw to outer catch
+      if (cliError.message && cliError.message.includes("EPHEMERAL FIELD DISAGREEMENT")) {
+        throw cliError;
+      }
+
+      // TODO make sure not to print duplicate error output if cleaner review output is printed
+      console.error(cliError);
+      const reviewOutput = JSON.parse(await runElmReview());
+      const isParsingError = reviewOutput.errors.some((reviewError) => {
+        return reviewError.errors.some((item) => item.rule === "ParsingError");
+      });
+      if (isParsingError) {
+        console.error(cliError);
+      } else {
+        console.error(restoreColorSafe(reviewOutput));
+      }
+      process.exit(1);
+    }
+    await portBackendTaskCompiled;
+    const cliDone = runCli(options);
+    await cliDone;
+
+    await runAdapter(
+      config.adapter ||
+        function () {
+          console.log(
+            "No adapter configured in elm-pages.config.mjs. Skipping adapter step."
+          );
+        },
+      processedIndexTemplate
+    );
+  } catch (error) {
+    if (error) {
+      // Plain Error objects (like disagreement errors) should be printed directly
+      // Only use restoreColorSafe for elm-review formatted errors
+      if (error instanceof Error) {
+        console.error(error.message);
+      } else {
+        console.error(restoreColorSafe(error));
+      }
+    }
+    buildError = true;
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * @param {string} basePath
+ */
+function initWorker(basePath, whenDone) {
+  return new Promise((resolve, reject) => {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    activeWorkers += 1;
+    let newWorker = {
+      worker: new Worker(path.join(__dirname, "./render-worker.js"), {
+        env: SHARE_ENV,
+        workerData: { basePath },
+      }),
+    };
+    newWorker.worker.once("online", () => {
+      newWorker.worker.on("message", (message) => {
+        if (message.tag === "all-paths") {
+          pagesReadyCalled = true;
+          pagesReady(JSON.parse(message.data));
+        } else if (message.tag === "error") {
+          process.exitCode = 1;
+          console.error(restoreColorSafe(message.data));
+          if (!pagesReadyCalled) {
+            // when there is a build error while resolving all-paths, we don't know which pages to build so we need to short-circuit
+            // and give an error instead of trying to build the remaining pages to show as many errors as possible
+            pagesReady([]);
+            reject(message.data);
+          }
+          buildError = true;
+          buildNextPage(newWorker, whenDone);
+        } else if (message.tag === "done") {
+          buildNextPage(newWorker, whenDone);
+        } else {
+          throw `Unhandled tag ${message.tag}`;
+        }
+      });
+      newWorker.worker.on("error", (error) => {
+        console.error("Unhandled worker exception", error);
+        buildError = true;
+        process.exitCode = 1;
+        buildNextPage(newWorker, whenDone);
+      });
+      resolve(newWorker);
+    });
+  });
+}
+
+/**
+ */
+function prepareStaticPathsNew(thread) {
+  thread.worker.postMessage({
+    portsFilePath: global.portsFilePath,
+    mode: "build",
+    tag: "render",
+    pathname: "/all-paths.json",
+  });
+}
+
+async function buildNextPage(thread, allComplete) {
+  let nextPage = (await pages).pop();
+  if (nextPage) {
+    thread.worker.postMessage({
+      portsFilePath: global.portsFilePath,
+      mode: "build",
+      tag: "render",
+      pathname: nextPage,
+    });
+  } else {
+    thread.worker.terminate();
+    activeWorkers -= 1;
+    allComplete();
+  }
+}
+
+function runCli(options) {
+  return new Promise((resolve, reject) => {
+    const whenDone = () => {
+      if (activeWorkers === 0) {
+        // wait for the remaining tasks in the pool to complete once the pages queue is emptied
+        Promise.all(pool).then((value) => {
+          if (buildError) {
+            reject();
+          } else {
+            resolve(value);
+          }
+        });
+      }
+    };
+    const cpuCount = os.cpus().length;
+
+    const getPathsWorker = initWorker(options.base, whenDone);
+    getPathsWorker.then(prepareStaticPathsNew);
+    const threadsToCreate = Math.max(1, cpuCount - 1);
+    pool.push(getPathsWorker);
+    for (let index = 0; index < threadsToCreate - 1; index++) {
+      pool.push(initWorker(options.base, whenDone));
+    }
+    pool.forEach((threadPromise) => {
+      threadPromise.then((thread) => buildNextPage(thread, whenDone));
+    });
+  });
+}
+
+/**
+ * Compile the client-side Elm code.
+ * @returns {Promise<{ephemeralFields: Map<string, Set<string>>, deOptimizationCount: number}>}
+ */
+async function compileElm(options, config) {
+  ensureDirSync("dist");
+  const fullOutputPath = path.join(process.cwd(), `./dist/elm.js`);
+  const clientResult = await generateClientFolder(options.base);
+
+  // NOTE: DCE transform is applied in generateClientFolder via runElmReviewCodemod.
+  // It transforms the COPIED source in elm-stuff/elm-pages/client/app/, not the original.
+  // This allows the CLI bundle (for extraction) to use original source while
+  // the client bundle uses transformed source for dead-code elimination.
+
+  await spawnElmMake(
+    resolveCompileMode(options),
+    options,
+    ".elm-pages/Main.elm",
+    fullOutputPath,
+    path.join(process.cwd(), "./elm-stuff/elm-pages/client")
+  );
+
+  // Patch the virtual DOM so it can draw frozen views
+  const elmCode = await fsPromises.readFile(fullOutputPath, "utf-8");
+  const patchedCode = patchFrozenViews(elmCode);
+  await fsPromises.writeFile(fullOutputPath, patchedCode);
+
+  if (!options.debug) {
+    await runTerser(fullOutputPath);
+  }
+
+  return { ephemeralFields: clientResult.ephemeralFields, deOptimizationCount: clientResult.deOptimizationCount || 0 };
+}
+
+async function fingerprintElmAsset(fullOutputPath, withoutExtension) {
+  const fileHash = await fsPromises
+    .readFile(fullOutputPath, "utf8")
+    .then(getAssetHash);
+  await fsPromises.copyFile(
+    fullOutputPath,
+    `${withoutExtension}.${fileHash}.js`
+  );
+  return fileHash;
+}
+
+/** @typedef {"debug" | "optimize" | "default"} CompileMode  */
+
+/**
+ * @param {CompileMode} mode
+ * @param {string} elmEntrypointPath
+ * @param {string} outputPath
+ * @param {string | undefined} cwd
+ */
+async function spawnElmMake(mode, options, elmEntrypointPath, outputPath, cwd) {
+  await runElmMake(mode, options, elmEntrypointPath, outputPath, cwd);
+  if (mode === "optimize" && (options.optimize === "2" || options.optimize === true)) {
+    await elmOptimizeLevel2(outputPath, cwd);
+  }
+  await fsPromises.writeFile(
+    outputPath,
+    (await fsPromises.readFile(outputPath, "utf-8")).replace(
+      /return \$elm\$json\$Json\$Encode\$string\(.REPLACE_ME_WITH_FORM_TO_STRING.\)/g,
+      "function appendSubmitter (myFormData, event) { event.submitter && event.submitter.name && event.submitter.name.length > 0 ? myFormData.append(event.submitter.name, event.submitter.value) : myFormData;  return myFormData }; return " +
+        (options.debug
+          ? "_Json_wrap(Array.from(appendSubmitter(new FormData(_Json_unwrap(event).target), _Json_unwrap(event))))"
+          : "[...(appendSubmitter(new FormData(event.target), event))]")
+    )
+  );
+}
+
+function getAssetHash(content) {
+  return createHash("sha256").update(content).digest("hex").slice(0, 8);
+}
+
+
+/**
+ * @param {CompileMode} mode
+ * @param {string} elmEntrypointPath
+ * @param {string} outputPath
+ * @param {string | undefined} cwd
+ */
+function runElmMake(mode, options, elmEntrypointPath, outputPath, cwd) {
+  return new Promise(async (resolve, reject) => {
+    const executableName = options.executableName || "lamdera";
+    const subprocess = spawnCallback(
+      executableName,
+      [
+        "make",
+        elmEntrypointPath,
+        "--output",
+        outputPath,
+        ...modeToOptions(mode),
+        "--report",
+        "json",
+      ],
+      {
+        // ignore stdout
+        // stdio: ["inherit", "ignore", "inherit"],
+
+        cwd: cwd,
+      }
+    );
+    if (await fs.fileExists(outputPath)) {
+      await fsPromises.unlink(outputPath, {
+        force: true /* ignore errors if file doesn't exist */,
+      });
+    }
+    let commandOutput = "";
+
+    subprocess.stderr.on("data", function (data) {
+      commandOutput += data;
+    });
+    subprocess.on("error", function () {
+      reject(commandOutput);
+    });
+
+    subprocess.on("close", async (code) => {
+      if (
+        code == 0 &&
+        (await fs.fileExists(outputPath)) &&
+        commandOutput === ""
+      ) {
+        resolve();
+      } else {
+        if (!buildError) {
+          buildError = true;
+          try {
+            reject(restoreColorSafe(commandOutput));
+          } catch (error) {
+            reject(commandOutput);
+          }
+        } else {
+          // avoid unhandled error printing duplicate message, let process.exit in top loop take over
+        }
+      }
+    });
+  });
+}
+
+/**
+ * @param {string} filePath
+ */
+export async function runTerser(filePath) {
+  console.log("Running terser");
+  const terser = await import("terser");
+  const minifiedElm = await terser.minify(
+    (await fsPromises.readFile(filePath)).toString(),
+    {
+      ecma: 5,
+
+      module: true,
+      compress: {
+        pure_funcs: [
+          "F2",
+          "F3",
+          "F4",
+          "F5",
+          "F6",
+          "F7",
+          "F8",
+          "F9",
+          "A2",
+          "A3",
+          "A4",
+          "A5",
+          "A6",
+          "A7",
+          "A8",
+          "A9",
+        ],
+        pure_getters: true,
+        keep_fargs: false,
+        unsafe_comps: true,
+        unsafe: true,
+        passes: 2,
+      },
+      mangle: {},
+    }
+  );
+  if (minifiedElm.code) {
+    await fsPromises.writeFile(filePath, minifiedElm.code);
+  } else {
+    throw "Error running terser.";
+  }
+}
+
+/**
+ * Compile the server-side CLI app.
+ * @returns {Promise<{ephemeralFields: Map<string, Set<string>>}>}
+ */
+export async function compileCliApp(options) {
+  // Generate server folder with server-specific codemods
+  // This transforms Data -> Ephemeral, creates reduced Data, generates ephemeralToData
+  // Skip for scripts (elm-pages run) that don't have routes/app folder
+  let serverResult = { ephemeralFields: new Map() };
+  if (!options.isScript) {
+    serverResult = await generateServerFolder(options.base);
+  }
+
+  // Scripts use the original path (elm-stuff/elm-pages/.elm-pages/)
+  // Full builds use the server path (elm-stuff/elm-pages/server/.elm-pages/)
+  const elmPagesFolder = options.isScript
+    ? "elm-stuff/elm-pages"
+    : "elm-stuff/elm-pages/server";
+
+  await spawnElmMake(
+    // TODO should be --optimize, but there seems to be an issue with the html to JSON with --optimize
+    resolveCompileMode(options),
+    options,
+    path.join(
+      process.cwd(),
+      `${elmPagesFolder}/.elm-pages/${options.mainModule || "Main"}.elm`
+    ),
+    path.join(process.cwd(), "elm-stuff/elm-pages/elm.js"),
+    path.join(process.cwd(), elmPagesFolder)
+  );
+
+  const elmFileContent = await fsPromises.readFile(ELM_FILE_PATH(), "utf-8");
+  await fsPromises.writeFile(
+    ELM_FILE_PATH().replace(/\.js$/, ".cjs"),
+    applyScriptPatches(options, patchCompiledCliApp(elmFileContent))
+  );
+
+  return { ephemeralFields: serverResult.ephemeralFields };
+}
+
+function applyScriptPatches(options, input) {
+  if (options.isScript) {
+    return input.replace(
+      `_Debug_crash(8, moduleName, region, message)`,
+      "console.error('TODO in module `' + moduleName + '` ' + _Debug_regionToString(region) + '\\n\\n' + message); process.exitCode = 1; debugger; throw 'CRASH!';"
+    );
+  } else {
+    return input;
+  }
+}
+
+async function runAdapter(adaptFn, processedIndexTemplate) {
+  try {
+    await adaptFn({
+      renderFunctionFilePath: "./.elm-pages/compiled/render.mjs",
+      routePatterns: JSON.parse(
+        await fsPromises.readFile("./dist/route-patterns.json", "utf-8")
+      ),
+      apiRoutePatterns: JSON.parse(
+        await fsPromises.readFile("./dist/api-patterns.json", "utf-8")
+      ),
+    });
+    console.log("Success - Adapter script complete");
+  } catch (error) {
+    console.trace("ERROR - Adapter script failed", error);
+    try {
+      console.error(JSON.stringify(error));
+    } catch (parsingError) {
+      console.error(error);
+    }
+    process.exit(1);
+  }
+}
+
+// Source: https://github.com/vitejs/vite/blob/c53ffec3465d2d28d08d29ca61313469e03f5dd6/playground/ssr-vue/src/entry-server.js#L50-L68
+/**
+ * @param {string} file
+ */
+function defaultPreloadForFile(file) {
+  if (/\/elm\.[a-f0-9]+\.js$/.test(file)) {
+    return `<link rel="preload" as="script" href="${file}">`;
+  } else if (file.endsWith(".js")) {
+    return `<link rel="modulepreload" crossorigin href="${file}">`;
+  } else if (file.endsWith(".css")) {
+    return `<link rel="preload" href="${file}" as="style">`;
+  } else if (file.endsWith(".woff")) {
+    return ` <link rel="preload" href="${file}" as="font" type="font/woff" crossorigin>`;
+  } else if (file.endsWith(".woff2")) {
+    return ` <link rel="preload" href="${file}" as="font" type="font/woff2" crossorigin>`;
+  } else if (file.endsWith(".gif")) {
+    return ` <link rel="preload" href="${file}" as="image" type="image/gif">`;
+  } else if (file.endsWith(".jpg") || file.endsWith(".jpeg")) {
+    return ` <link rel="preload" href="${file}" as="image" type="image/jpeg">`;
+  } else if (file.endsWith(".png")) {
+    return ` <link rel="preload" href="${file}" as="image" type="image/png">`;
+  } else {
+    // TODO
+    return "";
+  }
+}
+
+/** @typedef { { route : string; contentJson : string; head : SeoTag[]; html: string; body: string; } } FromElm */
+/** @typedef {HeadTag | JsonLdTag} SeoTag */
+/** @typedef {{ name: string; attributes: string[][]; type: 'head' }} HeadTag */
+/** @typedef {{ contents: Object; type: 'json-ld' }} JsonLdTag */
+
+/** @typedef { { tag : 'PageProgress'; args : Arg[] } } PageProgress */
+
+/** @typedef {     { body: string; head: any[]; errors: any[]; contentJson: any[]; html: string; route: string; title: string; } } Arg */
+
+/**
+ * @param {Arg} fromElm
+ * @param {string} contentJsonString
+ * @returns {string}
+ */

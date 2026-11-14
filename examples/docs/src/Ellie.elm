@@ -1,11 +1,10 @@
 module Ellie exposing (outputTab)
 
-import Element exposing (Element)
-import Html
+import Html exposing (Html)
 import Html.Attributes as Attr
 
 
-outputTab : String -> Element msg
+outputTab : String -> Html msg
 outputTab ellieId =
     Html.iframe
         [ Attr.src <| "https://ellie-app.com/embed/" ++ ellieId ++ "?panel=output"
@@ -16,5 +15,3 @@ outputTab ellieId =
         , Attr.attribute "sandbox" "allow-modals allow-forms allow-popups allow-scripts allow-same-origin"
         ]
         []
-        |> Element.html
-        |> Element.el [ Element.width Element.fill ]
